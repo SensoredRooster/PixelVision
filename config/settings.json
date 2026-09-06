@@ -1,0 +1,13 @@
+{
+  "capture_mode": "screen",
+  "camera_index": 0,
+  "motion_threshold": 25.0,
+  "min_area": 500,
+  "capture_width": 1280,
+  "capture_height": 720,
+  "screen_monitor_index": 1,
+  "screen_region": [0, 0, 1920, 1080],
+  "playback_fps": 0,
+  "log_directory": "logs",
+  "window_title": "PixelVision"
+}

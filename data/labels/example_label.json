@@ -1,0 +1,14 @@
+{
+  "filename": "sample_suspicious_001.mp4",
+  "label": "aimbot",
+  "game": "GameName",
+  "map": "MapA",
+  "mode": "ranked",
+  "resolution": "1920x1080",
+  "fps": 60,
+  "source": "local",
+  "confidence": 0.82,
+  "notes": "Suspected snap aiming and impossible flick shots",
+  "start_time": "00:00:12",
+  "end_time": "00:00:28"
+}
