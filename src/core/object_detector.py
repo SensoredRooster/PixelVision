@@ -19,6 +19,11 @@ class PixelVisionObjectDetector:
         self.conf_threshold = conf_threshold
         self.nms_threshold = nms_threshold
         self.player_class_ids = player_class_ids if player_class_ids is not None else []
+        if not self.player_class_ids:
+            print(
+                "[DETECTOR] [WARN] player_class_ids is empty -- detection is filter-closed "
+                "and will match zero classes until configured (e.g. [0] for 'person')."
+            )
         self.ort_session = None
         self.active_tracks: dict[int, tuple[int, int, int, int, int]] = {}
         self.track_miss_streak: dict[int, int] = {}
@@ -51,7 +56,7 @@ class PixelVisionObjectDetector:
         if predictions.ndim != 3 or predictions.shape[0] != 1:
             return "unknown"
         axis1_size, axis2_size = predictions.shape[1], predictions.shape[2]
-        if axis2_size >> 1 > axis1_size:
+        if axis1_size > axis2_size:
             return "yolov5"
         else:
             return "yolov8"
@@ -70,7 +75,7 @@ class PixelVisionObjectDetector:
                 confidence = obj_conf * float(class_scores[class_id])
                 if confidence <= self.conf_threshold:
                     continue
-                if self.player_class_ids and class_id not in self.player_class_ids:
+                if class_id not in self.player_class_ids:
                     continue
 
                 x_center, y_center = float(pred[0]), float(pred[1])
@@ -88,7 +93,7 @@ class PixelVisionObjectDetector:
                 confidence = float(class_scores[class_id])
                 if confidence <= self.conf_threshold:
                     continue
-                if self.player_class_ids and class_id not in self.player_class_ids:
+                if class_id not in self.player_class_ids:
                     continue
 
                 detections.append((x_center, y_center, box_w, box_h, confidence, class_id))

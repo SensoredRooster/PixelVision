@@ -10,7 +10,7 @@ from src.core.anti_cheat_pipeline import AntiCheatPipeline, FrameContext
 
 
 class PixelVisionDatasetProcessor:
-    def __init__(self, target_resolution: tuple[int, int] = (1920, 1080)):
+    def __init__(self, target_resolution: tuple[int, int] = (2560, 1440)):
         self.target_res = target_resolution
         self.pipeline = AntiCheatPipeline()
 

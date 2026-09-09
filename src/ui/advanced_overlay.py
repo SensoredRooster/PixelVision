@@ -9,7 +9,7 @@ import numpy as np
 
 
 class PixelVisionAdvancedOverlayEngine:
-    def __init__(self, target_resolution: Tuple[int, int] = (1920, 1080)):
+    def __init__(self, target_resolution: Tuple[int, int] = (2560, 1440)):
         self.width, self.height = target_resolution
         self.event_history = deque(maxlen=6)
         self.font = cv2.FONT_HERSHEY_SIMPLEX
@@ -51,71 +51,70 @@ class PixelVisionAdvancedOverlayEngine:
         blended_frame = cv2.addWeighted(base_frame, 0.75, color_heatmap, 0.25, 0)
         return blended_frame
 
-    def render_scoreboard_panel(self, canvas: np.ndarray) -> None:
-        panel_w, panel_h = 360, 240
-        margin = 20
-
-        sub_surface = canvas[margin : margin + panel_h, margin : margin + panel_w]
-        black_bg = np.zeros_like(sub_surface)
-        canvas[margin : margin + panel_h, margin : margin + panel_w] = cv2.addWeighted(
-            sub_surface, 0.4, black_bg, 0.6, 0
-        )
-
-        cv2.rectangle(canvas, (margin, margin), (margin + panel_w, margin + panel_h), (0, 255, 0), 1)
-        cv2.putText(
-            canvas,
-            "PV EVENT HISTORY LOG",
-            (margin + 15, margin + 25),
-            self.font,
-            0.5,
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.line(canvas, (margin + 10, margin + 35), (margin + panel_w - 10, margin + 35), (0, 255, 0), 1)
-
-        start_y = margin + 60
-        for idx, event in enumerate(self.event_history):
-            event_str = f"[{event['time']}] FR:{event['frame']} | {event['type']} ({event['conf']})"
-            text_color = (0, 0, 255) if "SNAP" in event["type"] else (255, 255, 255)
-            cv2.putText(
-                canvas,
-                event_str,
-                (margin + 15, start_y + (idx * 25)),
-                self.font,
-                0.4,
-                text_color,
-                1,
-                cv2.LINE_AA,
-            )
-
     def compile_display_frame(
         self,
         raw_frame: np.ndarray,
         tracked_entities: list[dict[str, Any]],
         flagged_event: Optional[Any],
         mode: str = "standard",
+        flagged_track_ids: Optional[set[int]] = None,
     ) -> np.ndarray:
         is_flagged = flagged_event is not None
         if is_flagged:
             self.log_event(flagged_event.frame_id, flagged_event.cheat_category, flagged_event.confidence_score)
 
-        self.update_heatmap(tracked_entities, is_flagged)
-
         if mode == "flagged_only":
-            display_canvas = np.zeros_like(raw_frame)
-            if is_flagged:
-                for entity in tracked_entities:
-                    bbox = entity.get("bbox", (0, 0, 0, 0))
-                    x1, y1, x2, y2 = bbox
-                    display_canvas[y1:y2, x1:x2] = raw_frame[y1:y2, x1:x2]
-                    cv2.rectangle(display_canvas, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            display_canvas = self._generate_flagged_view(raw_frame, tracked_entities, flagged_track_ids or set())
         elif mode == "heatmap":
+            self.update_heatmap(tracked_entities, is_flagged)
             display_canvas = self.generate_heatmap_overlay(raw_frame)
         else:
             display_canvas = raw_frame.copy()
 
-        self.render_scoreboard_panel(display_canvas)
+        return display_canvas
+
+    def _generate_flagged_view(
+        self,
+        raw_frame: np.ndarray,
+        tracked_entities: list[dict[str, Any]],
+        flagged_track_ids: set[int],
+    ) -> np.ndarray:
+        display_canvas = raw_frame.copy()
+        if not flagged_track_ids:
+            self._draw_chip(display_canvas, "No flags in this session")
+            return display_canvas
+
+        for entity in tracked_entities:
+            if entity.get("track_id") not in flagged_track_ids:
+                continue
+            x1, y1, x2, y2 = entity.get("bbox", (0, 0, 0, 0))
+            cv2.rectangle(display_canvas, (x1, y1), (x2, y2), (92, 59, 255), 2)
+        return display_canvas
+
+    def _draw_chip(self, canvas: np.ndarray, text: str) -> None:
+        (text_w, text_h), _ = cv2.getTextSize(text, self.font, 0.5, 1)
+        pad = 8
+        x1, y1 = 16, 16
+        x2 = min(canvas.shape[1], x1 + text_w + pad * 2)
+        y2 = min(canvas.shape[0], y1 + text_h + pad * 2)
+        region = canvas[y1:y2, x1:x2]
+        canvas[y1:y2, x1:x2] = cv2.addWeighted(region, 0.4, np.zeros_like(region), 0.6, 0)
+        cv2.putText(canvas, text, (x1 + pad, y2 - pad), self.font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+    def generate_track_mask_debug_view(
+        self,
+        raw_frame: np.ndarray,
+        tracked_entities: list[dict[str, Any]],
+        is_flagged: bool,
+    ) -> np.ndarray:
+        """Hidden debug view -- the original reveal-mask behavior, kept for diagnostics only."""
+        display_canvas = np.zeros_like(raw_frame)
+        if is_flagged:
+            for entity in tracked_entities:
+                bbox = entity.get("bbox", (0, 0, 0, 0))
+                x1, y1, x2, y2 = bbox
+                display_canvas[y1:y2, x1:x2] = raw_frame[y1:y2, x1:x2]
+                cv2.rectangle(display_canvas, (x1, y1), (x2, y2), (0, 0, 255), 2)
         return display_canvas
 
 

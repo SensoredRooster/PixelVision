@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -32,10 +33,19 @@ class CrosshairKinematicsAnalyzer:
         self.straightness_threshold = straightness_threshold
         self.zero_variance_epsilon = zero_variance_epsilon
         self.point_history: deque[tuple[int, int]] = deque(maxlen=window_size)
-        self.time_history: deque[float] = deque(maxlen=window_size)
         self.previous_gray: Optional[np.ndarray] = None
         self.smoothed_point: Optional[tuple[float, float]] = None
         self.zero_tremor_streak = 0
+        self.last_metrics: dict[str, Any] | None = None
+        self._lock = threading.Lock()
+
+    def reset(self) -> None:
+        with self._lock:
+            self.point_history.clear()
+            self.previous_gray = None
+            self.smoothed_point = None
+            self.zero_tremor_streak = 0
+            self.last_metrics = None
 
     def _roi_bounds(self, frame_shape: tuple[int, ...]) -> tuple[int, int, int, int]:
         height, width = frame_shape[:2]
@@ -49,39 +59,20 @@ class CrosshairKinematicsAnalyzer:
         y2 = min(height, center_y + roi_half_h)
         return x1, y1, x2, y2
 
-    def _estimate_crosshair_point(self, frame_gray: np.ndarray) -> tuple[int, int]:
-        height, width = frame_gray.shape[:2]
+    def _estimate_crosshair_point(self, motion_delta: np.ndarray) -> tuple[int, int] | None:
+        height, width = motion_delta.shape[:2]
         center = (width // 2, height // 2)
 
-        x1, y1, x2, y2 = self._roi_bounds(frame_gray.shape)
-        roi_mask = np.zeros_like(frame_gray, dtype=np.uint8)
-        roi_mask[y1:y2, x1:x2] = 255
-
-        features = cv2.goodFeaturesToTrack(
-            frame_gray,
-            maxCorners=24,
-            qualityLevel=0.01,
-            minDistance=7,
-            mask=roi_mask,
-            blockSize=7,
-        )
-        if features is not None and len(features) > 0:
-            centroid = np.mean(features.reshape(-1, 2), axis=0)
-            return (int(round(float(centroid[0]))), int(round(float(centroid[1]))))
-
-        if self.previous_gray is None:
-            return center
-
-        delta = cv2.absdiff(self.previous_gray, frame_gray)
-        roi = delta[y1:y2, x1:x2]
+        x1, y1, x2, y2 = self._roi_bounds(motion_delta.shape)
+        roi = motion_delta[y1:y2, x1:x2]
         if roi.size == 0:
-            return center
+            return None
 
-        _, motion_mask = cv2.threshold(roi, 20, 255, cv2.THRESH_BINARY)
+        _, motion_mask = cv2.threshold(roi, 18, 255, cv2.THRESH_BINARY)
         motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
         weight_sum = float(np.sum(motion_mask))
         if weight_sum <= 0.0:
-            return center
+            return None
 
         yy, xx = np.indices(motion_mask.shape, dtype=np.float32)
         centroid_x = float(np.sum(xx * motion_mask) / weight_sum) + x1
@@ -103,78 +94,101 @@ class CrosshairKinematicsAnalyzer:
         residuals = np.linalg.norm(coords - projected, axis=1)
         return residuals.astype(np.float32)
 
-    def update(self, frame: np.ndarray, timestamp: float) -> Optional[dict[str, Any]]:
-        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        raw_point = self._estimate_crosshair_point(frame_gray)
-        if self.smoothed_point is None:
-            self.smoothed_point = (float(raw_point[0]), float(raw_point[1]))
-        else:
-            self.smoothed_point = (
-                (self.smoothed_point[0] * 0.6) + (float(raw_point[0]) * 0.4),
-                (self.smoothed_point[1] * 0.6) + (float(raw_point[1]) * 0.4),
+    def update(self, frame: np.ndarray, timestamp: float | None = None) -> Optional[dict[str, Any]]:
+        with self._lock:
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if self.previous_gray is None or self.previous_gray.shape != frame_gray.shape:
+                self.previous_gray = frame_gray.copy()
+                self.point_history.clear()
+                self.smoothed_point = None
+                self.zero_tremor_streak = 0
+                self.last_metrics = None
+                return None
+
+            motion_delta = cv2.absdiff(self.previous_gray, frame_gray)
+            self.previous_gray = frame_gray.copy()
+
+            raw_point = self._estimate_crosshair_point(motion_delta)
+            if raw_point is None:
+                self.last_metrics = {
+                    "flagged": False,
+                    "point": (0, 0),
+                    "velocity": 0.0,
+                    "straightness": 0.0,
+                    "tremor_variance": 0.0,
+                    "zero_tremor_streak": self.zero_tremor_streak,
+                    "path": [],
+                }
+                return None
+
+            if self.smoothed_point is None:
+                self.smoothed_point = (float(raw_point[0]), float(raw_point[1]))
+            else:
+                self.smoothed_point = (
+                    (self.smoothed_point[0] * 0.6) + (float(raw_point[0]) * 0.4),
+                    (self.smoothed_point[1] * 0.6) + (float(raw_point[1]) * 0.4),
+                )
+
+            point = (int(round(self.smoothed_point[0])), int(round(self.smoothed_point[1])))
+            self.point_history.append(point)
+
+            if len(self.point_history) < 4:
+                return None
+
+            coords = np.array(self.point_history, dtype=np.float32)
+            step_vectors = np.diff(coords, axis=0)
+            step_distances = np.linalg.norm(step_vectors, axis=1)
+            displacement = float(np.linalg.norm(coords[-1] - coords[0]))
+            total_path_length = float(np.sum(step_distances))
+            straightness = float(displacement / total_path_length) if total_path_length > 0.0 else 1.0
+
+            residuals = self._line_residuals(coords)
+            tremor_variance = float(np.var(residuals))
+            mean_velocity = float(np.mean(step_distances))
+
+            if mean_velocity > self.velocity_threshold and tremor_variance <= self.zero_variance_epsilon:
+                self.zero_tremor_streak += 1
+            else:
+                self.zero_tremor_streak = 0
+
+            event_type: Optional[str] = None
+            if mean_velocity > self.velocity_threshold and straightness >= self.straightness_threshold:
+                event_type = "UNNATURAL_GEOMETRIC_LINE"
+
+            if self.zero_tremor_streak >= 3:
+                event_type = "MECHANICAL_LOCK_NO_TREMOR"
+
+            if event_type is None:
+                self.last_metrics = {
+                    "flagged": False,
+                    "point": point,
+                    "velocity": mean_velocity,
+                    "straightness": straightness,
+                    "tremor_variance": tremor_variance,
+                    "zero_tremor_streak": self.zero_tremor_streak,
+                    "path": coords.tolist(),
+                    "residuals": residuals.tolist(),
+                }
+                return None
+
+            confidence = min(
+                1.0,
+                max(
+                    straightness,
+                    mean_velocity / max(self.velocity_threshold, 1e-4),
+                ),
             )
 
-        point = (int(round(self.smoothed_point[0])), int(round(self.smoothed_point[1])))
-        self.point_history.append(point)
-        self.time_history.append(timestamp)
-        self.previous_gray = frame_gray.copy()
-
-        if len(self.point_history) < 3:
-            return None
-
-        coords = np.array(self.point_history, dtype=np.float32)
-        times = np.array(self.time_history, dtype=np.float32)
-        step_vectors = np.diff(coords, axis=0)
-        step_distances = np.linalg.norm(step_vectors, axis=1)
-        elapsed = float(max(times[-1] - times[0], 1e-4))
-        displacement = float(np.linalg.norm(coords[-1] - coords[0]))
-        total_path_length = float(np.sum(step_distances))
-        straightness = float(displacement / total_path_length) if total_path_length > 0.0 else 1.0
-
-        residuals = self._line_residuals(coords)
-        tremor_variance = float(np.var(residuals))
-        mean_velocity = float(displacement / elapsed)
-
-        if mean_velocity > self.velocity_threshold and tremor_variance <= self.zero_variance_epsilon:
-            self.zero_tremor_streak += 1
-        else:
-            self.zero_tremor_streak = 0
-
-        event_type: Optional[str] = None
-        if mean_velocity > self.velocity_threshold and straightness >= self.straightness_threshold:
-            event_type = "UNNATURAL_GEOMETRIC_LINE"
-
-        if self.zero_tremor_streak >= 3:
-            event_type = "MECHANICAL_LOCK_NO_TREMOR"
-
-        if event_type is None:
-            return {
-                "flagged": False,
+            self.last_metrics = {
+                "flagged": True,
+                "event_type": event_type,
                 "point": point,
                 "velocity": mean_velocity,
                 "straightness": straightness,
                 "tremor_variance": tremor_variance,
                 "zero_tremor_streak": self.zero_tremor_streak,
+                "confidence": confidence,
                 "path": coords.tolist(),
+                "residuals": residuals.tolist(),
             }
-
-        confidence = min(
-            1.0,
-            max(
-                straightness,
-                mean_velocity / max(self.velocity_threshold, 1e-4),
-            ),
-        )
-
-        return {
-            "flagged": True,
-            "event_type": event_type,
-            "point": point,
-            "velocity": mean_velocity,
-            "straightness": straightness,
-            "tremor_variance": tremor_variance,
-            "zero_tremor_streak": self.zero_tremor_streak,
-            "confidence": confidence,
-            "path": coords.tolist(),
-            "residuals": residuals.tolist(),
-        }
+            return self.last_metrics

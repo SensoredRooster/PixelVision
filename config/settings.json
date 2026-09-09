@@ -15,6 +15,7 @@
   "player_detector_model_path": "data/models/yolov8n_gaming.onnx",
   "detection_confidence_threshold": 0.45,
   "detection_nms_threshold": 0.45,
-  "detection_player_class_ids": [],
-  "detection_corroboration_margin_px": 12
+  "detection_player_class_ids": [0],
+  "detection_corroboration_margin_px": 12,
+  "facecam_roi": []
 }

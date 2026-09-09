@@ -9,3 +9,6 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Local baseline/session video recordings - large binary test output, not source.
+data/clean/

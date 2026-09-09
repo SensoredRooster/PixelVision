@@ -59,7 +59,8 @@ class CaptureWorker(QObject):
             return self._latest_context
 
     def get_recent_frame_cache(self) -> list[np.ndarray]:
-        return list(self._recent_frame_cache)
+        with self._lock:
+            return list(self._recent_frame_cache)
 
     def estimate_live_fps(self) -> float:
         timestamps = list(self._live_frame_timestamps)
@@ -154,8 +155,8 @@ class CaptureWorker(QObject):
                 )
                 with self._lock:
                     self._latest_context = context
+                    self._recent_frame_cache.append(_downscale(frame, 960, 540))
                 self._live_frame_timestamps.append(timestamp)
-                self._recent_frame_cache.append(_downscale(frame, 960, 540))
                 self._dataset_exporter.write_frame(frame)
 
                 self.frameAvailable.emit(context.frame_id)
@@ -299,28 +300,34 @@ class AnalysisWorker(QObject):
         super().__init__()
         self._pipeline = pipeline
         self._dataset_exporter = dataset_exporter
+        self._source_lock = threading.Lock()
         self._capture_worker = capture_worker
         self._source: CaptureWorker | PlaybackWorker = capture_worker
         self._last_analyzed_frame_id = -1
 
     def set_source(self, source: CaptureWorker | "PlaybackWorker") -> None:
-        self._source = source
-        if isinstance(source, CaptureWorker):
-            self._capture_worker = source
-        self._last_analyzed_frame_id = -1
+        with self._source_lock:
+            self._source = source
+            if isinstance(source, CaptureWorker):
+                self._capture_worker = source
+            self._last_analyzed_frame_id = -1
 
     @Slot(int)
     def on_frame_available(self, frame_id: int) -> None:
-        if frame_id == self._last_analyzed_frame_id:
-            return
+        with self._source_lock:
+            if frame_id == self._last_analyzed_frame_id:
+                return
+            source = self._source
+            capture_worker = self._capture_worker
 
-        ctx = self._source.get_latest_context()
+        ctx = source.get_latest_context()
         if ctx is None or ctx.frame_id != frame_id:
             return
 
         if not self._pipeline.should_analyze_frame(ctx.frame_id):
             return
-        self._last_analyzed_frame_id = frame_id
+        with self._source_lock:
+            self._last_analyzed_frame_id = frame_id
 
         if ctx.analysis_frame is None:
             ctx.analysis_frame = _downscale(ctx.frame, 960, 540)
@@ -333,8 +340,8 @@ class AnalysisWorker(QObject):
 
         if event is not None:
             self.cheatEventDetected.emit(event)
-            if self._source is self._capture_worker and self._pipeline.should_export_suspicious_clip():
-                frames = self._capture_worker.get_recent_frame_cache()
+            if source is capture_worker and self._pipeline.should_export_suspicious_clip():
+                frames = capture_worker.get_recent_frame_cache()
                 self._dataset_exporter.export_suspicious_incident_clip(frames, event.frame_id)
 
 
@@ -344,14 +351,21 @@ class DetectionWorker(QObject):
     def __init__(self, pipeline: AntiCheatPipeline, source: CaptureWorker | PlaybackWorker, target_fps: int = 30):
         super().__init__()
         self._pipeline = pipeline
+        self._source_lock = threading.Lock()
         self._source = source
         self._target_fps = max(1, target_fps)
         self._stop_event = threading.Event()
         self._last_frame_id = -1
+        self._detection_enabled = False
 
     def set_source(self, source: CaptureWorker | PlaybackWorker) -> None:
-        self._source = source
-        self._last_frame_id = -1
+        with self._source_lock:
+            self._source = source
+            self._last_frame_id = -1
+
+    def set_detection_enabled(self, enabled: bool) -> None:
+        with self._source_lock:
+            self._detection_enabled = enabled
 
     @Slot()
     def start(self) -> None:
@@ -362,7 +376,10 @@ class DetectionWorker(QObject):
         frame_interval = 1.0 / self._target_fps
 
         while not self._stop_event.is_set():
-            ctx = self._source.get_latest_context()
+            with self._source_lock:
+                source = self._source
+
+            ctx = source.get_latest_context()
             if ctx is None or ctx.frame_id == self._last_frame_id:
                 time.sleep(0.001)
                 continue
@@ -372,8 +389,17 @@ class DetectionWorker(QObject):
             if ctx.analysis_frame is None:
                 ctx.analysis_frame = _downscale(ctx.frame, 960, 540)
 
+            with self._source_lock:
+                detection_enabled = self._detection_enabled
+            if not detection_enabled:
+                time.sleep(frame_interval)
+                continue
+
             try:
                 entities = self._pipeline.player_detector.detect_and_track(ctx.analysis_frame)
+                with self._source_lock:
+                    if source is not self._source:
+                        continue
                 self._pipeline.update_detected_entities(
                     entities, ctx.analysis_frame.shape, ctx.frame.shape
                 )

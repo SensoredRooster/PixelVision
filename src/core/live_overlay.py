@@ -8,8 +8,8 @@ import numpy as np
 
 class PixelVisionLiveOverlay:
     def __init__(self):
-        self.box_color = (0, 255, 0)
-        self.alert_color = (0, 0, 255)
+        self.box_color = (199, 230, 46)
+        self.alert_color = (92, 59, 255)
         self.text_color = (255, 255, 255)
         self.line_thickness = 2
         self.font = cv2.FONT_HERSHEY_SIMPLEX

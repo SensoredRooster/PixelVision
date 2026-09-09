@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +63,7 @@ class AntiCheatPipeline:
         detection_nms_threshold: float = 0.45,
         detection_player_class_ids: list[int] | None = None,
         detection_corroboration_margin_px: int = 12,
+        facecam_roi: tuple[int, int, int, int] | list[int] | None = None,
     ):
         self.logger = PixelVisionLogger(log_dir=log_dir)
         self.model_path = model_path
@@ -73,6 +75,7 @@ class AntiCheatPipeline:
         self.analysis_stride = max(1, int(analysis_stride))
         self.frame_counter = 0
         self.last_frame_hash: Optional[bytes] = None
+        self._entities_lock = threading.Lock()
         self.last_tracked_entities: list[dict[str, Any]] = []
         self.last_telemetry_snapshot: dict[str, Any] | None = None
         self.last_event_type: Optional[str] = None
@@ -86,6 +89,8 @@ class AntiCheatPipeline:
         )
         self.detector_has_result = False
         self.detection_corroboration_margin_px = detection_corroboration_margin_px
+        self.facecam_roi = tuple(facecam_roi) if facecam_roi else None
+        self._max_box_area_ratio = 0.35
         self._initialize_onnx_runtime()
 
     @property
@@ -124,12 +129,27 @@ class AntiCheatPipeline:
     def should_analyze_frame(self, frame_id: int) -> bool:
         return frame_id % self.analysis_stride == 0
 
+    def _is_excluded_region(self, x1: int, y1: int, x2: int, y2: int) -> bool:
+        if self.facecam_roi is not None:
+            rx1, ry1, rx2, ry2 = self.facecam_roi
+            overlap_x = min(x2, rx2) - max(x1, rx1)
+            overlap_y = min(y2, ry2) - max(y1, ry1)
+            if overlap_x > 0 and overlap_y > 0:
+                return True
+        return self.hud_masker.overlaps_masked_region(x1, y1, x2, y2)
+
+    def _exceeds_max_area(self, x1: int, y1: int, x2: int, y2: int, display_w: int, display_h: int) -> bool:
+        frame_area = max(1, display_w * display_h)
+        box_area = max(0, x2 - x1) * max(0, y2 - y1)
+        return (box_area / frame_area) > self._max_box_area_ratio
+
     def update_detected_entities(
         self, entities: list[dict[str, Any]], analysis_frame_shape: tuple[int, ...], display_frame_shape: tuple[int, ...]
     ) -> None:
         if not entities:
-            self.last_tracked_entities = []
-            self.detector_has_result = True
+            with self._entities_lock:
+                self.last_tracked_entities = []
+                self.detector_has_result = True
             return
 
         analysis_h, analysis_w = analysis_frame_shape[:2]
@@ -153,6 +173,11 @@ class AntiCheatPipeline:
             cx_rescaled = int(cx * scale_x)
             cy_rescaled = int(cy * scale_y)
 
+            if self._is_excluded_region(x1_rescaled, y1_rescaled, x2_rescaled, y2_rescaled):
+                continue
+            if self._exceeds_max_area(x1_rescaled, y1_rescaled, x2_rescaled, y2_rescaled, display_w, display_h):
+                continue
+
             rescaled_entities.append(
                 {
                     "track_id": entity.get("track_id", -1),
@@ -163,8 +188,16 @@ class AntiCheatPipeline:
                 }
             )
 
-        self.last_tracked_entities = rescaled_entities
-        self.detector_has_result = True
+        with self._entities_lock:
+            self.last_tracked_entities = rescaled_entities
+            self.detector_has_result = True
+
+    def get_tracked_entities(self) -> list[dict[str, Any]]:
+        with self._entities_lock:
+            return list(self.last_tracked_entities)
+
+    def update_target_resolution(self, width: int, height: int) -> None:
+        self.hud_masker.set_target_resolution(width, height)
 
     def process_frame(self, frame_context: FrameContext) -> Optional[CheatEvent]:
         self.frame_counter += 1
@@ -186,14 +219,18 @@ class AntiCheatPipeline:
         corroboration_suppressed = False
         associated_track_id = None
 
-        if self.detector_ready and self.detector_has_result:
+        with self._entities_lock:
+            detector_has_result = self.detector_has_result
+            tracked_entities_snapshot = list(self.last_tracked_entities)
+
+        if self.detector_ready and detector_has_result:
             crosshair_point = metrics.get("point", (0, 0))
             px, py = crosshair_point
 
             best_match = None
             best_confidence = 0.0
 
-            for entity in self.last_tracked_entities:
+            for entity in tracked_entities_snapshot:
                 bbox = entity.get("bbox", (0, 0, 0, 0))
                 x1, y1, x2, y2 = bbox
                 conf = entity.get("confidence", 0.0)
@@ -238,11 +275,12 @@ class AntiCheatPipeline:
 
     def reset_stream_state(self) -> None:
         self.last_frame_hash = None
-        self.last_tracked_entities = []
         self.last_telemetry_snapshot = None
         self.last_event_type = None
         self.last_mechanical_lock_detected = False
-        self.detector_has_result = False
+        with self._entities_lock:
+            self.last_tracked_entities = []
+            self.detector_has_result = False
         self.crosshair_analyzer.reset()
 
     def should_export_suspicious_clip(self) -> bool:
