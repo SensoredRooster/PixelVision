@@ -1,13 +1,20 @@
 {
-  "capture_mode": "screen",
+  "capture_mode": "camera",
   "camera_index": 0,
   "motion_threshold": 25.0,
   "min_area": 500,
-  "capture_width": 1280,
-  "capture_height": 720,
+  "capture_width": 2560,
+  "capture_height": 1440,
+  "capture_fps": 144,
   "screen_monitor_index": 1,
-  "screen_region": [0, 0, 1920, 1080],
+  "screen_region": [0, 0, 2560, 1440],
   "playback_fps": 0,
   "log_directory": "logs",
-  "window_title": "PixelVision"
+  "window_title": "PixelVision",
+  "detection_fps": 30,
+  "player_detector_model_path": "data/models/yolov8n_gaming.onnx",
+  "detection_confidence_threshold": 0.45,
+  "detection_nms_threshold": 0.45,
+  "detection_player_class_ids": [],
+  "detection_corroboration_margin_px": 12
 }
