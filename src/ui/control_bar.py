@@ -80,7 +80,8 @@ class ControlBar(QWidget):
         layout.addStretch(1)
 
         # Right cluster: capture mode, LIVE|VOD pill, analyze toggle, baseline.
-        layout.addWidget(self._build_capture_mode_group())
+        self.capture_mode_group = self._build_capture_mode_group()
+        layout.addWidget(self.capture_mode_group)
 
         self.mode_pill = QLabel("LIVE")
         self.mode_pill.setObjectName("ModePill")
@@ -170,6 +171,7 @@ class ControlBar(QWidget):
         self.mode_pill.setProperty("mode", mode)
         self.mode_pill.style().unpolish(self.mode_pill)
         self.mode_pill.style().polish(self.mode_pill)
+        self.capture_mode_group.setVisible(mode != "live")
 
     def set_active_view_mode(self, mode_id: str) -> None:
         button = self.view_buttons.get(mode_id)

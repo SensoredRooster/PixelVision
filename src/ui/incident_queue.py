@@ -11,6 +11,12 @@ from src.ui.theme import ACCENT, ALERT, TEXT_MUTED
 
 _COLUMNS = ("TIME", "CLASS", "CONF", "TRACK")
 
+# Hard cap on retained incidents so an unattended LIVE session (hours, possibly
+# a noisy detector) can't grow this list -- and the CheatEvent.telemetry_data
+# path/residuals arrays it carries -- without bound. Oldest rows are evicted
+# first; the review queue only ever needs to show what's recent.
+_MAX_INCIDENTS = 500
+
 
 class IncidentQueueModel(QAbstractTableModel):
     """Backs the live incident review queue: one row per detected CheatEvent."""
@@ -63,6 +69,11 @@ class IncidentQueueModel(QAbstractTableModel):
         return None
 
     def add_event(self, event: CheatEvent) -> None:
+        if len(self._events) >= _MAX_INCIDENTS:
+            self.beginRemoveRows(QModelIndex(), 0, 0)
+            self._events.pop(0)
+            self.endRemoveRows()
+
         row = len(self._events)
         self.beginInsertRows(QModelIndex(), row, row)
         self._events.append(event)

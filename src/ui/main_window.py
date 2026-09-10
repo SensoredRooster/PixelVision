@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import time
+from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Slot
-from PySide6.QtGui import QCloseEvent, QImage
+from PySide6.QtGui import QCloseEvent, QColor, QImage, QPainter
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -26,15 +28,19 @@ from src.ui.control_bar import ControlBar
 from src.ui.incident_queue import IncidentQueueTable
 from src.ui.playback_controls import PlaybackControlsBar
 from src.ui.telemetry_graph import PixelVisionTelemetryGraph
-from src.ui.theme import APP_STYLESHEET, WARNING
+from src.ui.theme import APP_STYLESHEET, PANEL, TEXT_MUTED, WARNING
 from src.ui.video_canvas import VideoCanvas
 from src.ui.workers import AnalysisWorker, CaptureWorker, DetectionWorker, PlaybackWorker
+
+# Cap on retained flagged-track markers so a continuous LIVE session can't grow
+# this without bound. Oldest flagged track is forgotten first (FIFO).
+_MAX_FLAGGED_TRACK_IDS = 500
 
 
 class RailCard(QFrame):
     """Small titled info card for the left rail (SOURCE / SIGNAL)."""
 
-    def __init__(self, title: str, parent=None):
+    def __init__(self, title: str, parent=None, *, word_wrap: bool = True):
         super().__init__(parent)
         self.setObjectName("RailCard")
         layout = QVBoxLayout(self)
@@ -44,12 +50,40 @@ class RailCard(QFrame):
         title_label.setObjectName("RailCardTitle")
         self._body_label = QLabel("—")
         self._body_label.setObjectName("RailCardBody")
-        self._body_label.setWordWrap(True)
+        self._body_label.setWordWrap(word_wrap)
         layout.addWidget(title_label)
         layout.addWidget(self._body_label)
 
     def set_body(self, text: str) -> None:
         self._body_label.setText(text)
+
+
+class VerticalLabel(QWidget):
+    """Narrow collapsed-drawer grip: paints its text rotated 90 degrees instead
+    of wrapping/clipping in a slim vertical strip."""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self._text = text
+
+    def setText(self, text: str) -> None:
+        self._text = text
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(PANEL))
+        painter.setPen(QColor(TEXT_MUTED))
+        font = painter.font()
+        font.setPixelSize(10)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.translate(self.width() / 2, self.height() / 2)
+        painter.rotate(-90)
+        metrics = painter.fontMetrics()
+        text_width = metrics.horizontalAdvance(self._text)
+        painter.drawText(int(-text_width / 2), int(metrics.ascent() / 2), self._text)
+        painter.end()
 
 
 class MainWindow(QMainWindow):
@@ -73,11 +107,6 @@ class MainWindow(QMainWindow):
         self.event_logger = EventLogger(log_dir)
         self.dataset_exporter = PixelVisionDatasetExporter(target_resolution=target_resolution, project_root=project_root)
         facecam_roi = settings.get("facecam_roi") or None
-        if facecam_roi is None:
-            fw, fh = target_resolution
-            if fw > 0 and fh > 0:
-                roi_w, roi_h = int(fw * 0.18), int(fh * 0.18)
-                facecam_roi = (fw - roi_w, fh - roi_h, fw, fh)
 
         self.pipeline = AntiCheatPipeline(
             log_dir=log_dir,
@@ -98,11 +127,14 @@ class MainWindow(QMainWindow):
         self._view_mode = "standard"
         self._stream_mode = "live"
         self._last_rendered_frame_id = -1
+        self._last_paint_time = 0.0
+        self._last_signal_paint_time = 0.0
         self._latest_telemetry: dict = {}
         self._pending_flagged_event: CheatEvent | None = None
         self._event_count = 0
-        self._flagged_track_ids: set[int] = set()
+        self._flagged_track_ids: OrderedDict[int, None] = OrderedDict()
         self._analyze_display_anyway = False
+        self._is_stream_frozen = False
         self._current_device_name = ""
         self._current_device: dict | None = None
 
@@ -147,7 +179,7 @@ class MainWindow(QMainWindow):
         rail_layout.setContentsMargins(10, 10, 10, 10)
         rail_layout.setSpacing(8)
         self.source_card = RailCard("Source")
-        self.signal_card = RailCard("Signal")
+        self.signal_card = RailCard("Signal", word_wrap=False)
         rail_layout.addWidget(self.source_card)
         rail_layout.addWidget(self.signal_card)
         rail_layout.addStretch(1)
@@ -158,7 +190,8 @@ class MainWindow(QMainWindow):
 
         self.incidents_drawer = QWidget(self)
         self.incidents_drawer.setObjectName("IncidentsDrawer")
-        self.incidents_drawer.setMinimumWidth(100)
+        self.incidents_drawer.setMinimumWidth(28)
+        self.incidents_drawer.setMaximumWidth(28)
         drawer_layout = QVBoxLayout(self.incidents_drawer)
         drawer_layout.setContentsMargins(0, 0, 0, 0)
         drawer_layout.setSpacing(0)
@@ -168,9 +201,8 @@ class MainWindow(QMainWindow):
         self.incident_queue_table.hide()
         drawer_layout.addWidget(self.incident_queue_table, 1)
 
-        self.incident_collapse_label = QLabel("INCIDENTS 0")
+        self.incident_collapse_label = VerticalLabel("INCIDENTS 0")
         self.incident_collapse_label.setObjectName("IncidentCollapseLabel")
-        self.incident_collapse_label.setAlignment(Qt.AlignCenter)
         drawer_layout.addWidget(self.incident_collapse_label, 1)
 
         self.body_splitter.addWidget(self.incidents_drawer)
@@ -181,7 +213,7 @@ class MainWindow(QMainWindow):
         self.body_splitter.setStretchFactor(0, 0)
         self.body_splitter.setStretchFactor(1, 1)
         self.body_splitter.setStretchFactor(2, 0)
-        self.body_splitter.setSizes([220, 1000, 100])
+        self.body_splitter.setSizes([220, 1000, 28])
 
         layout.addWidget(self.body_splitter, 1)
 
@@ -204,6 +236,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status_bar)
 
         self.control_bar.set_stream_mode(self._stream_mode)
+        self._update_signal_card()
 
     # ------------------------------------------------------------------
     # Startup / device lifecycle
@@ -309,10 +342,12 @@ class MainWindow(QMainWindow):
         self._detection_worker.set_source(self._playback_worker)
         self._last_rendered_frame_id = -1
         self._stream_mode = "vod"
+        self._is_stream_frozen = False
         self.control_bar.set_stream_mode(self._stream_mode)
+        self._update_signal_card()
 
         self._mounted_vod_name = Path(path).name
-        self._flagged_track_ids = set()
+        self._flagged_track_ids = OrderedDict()
         self._update_detection_enabled()
         self.control_bar.set_recording_baseline(self.dataset_exporter.is_recording_baseline, "vod")
 
@@ -348,8 +383,10 @@ class MainWindow(QMainWindow):
         self._analysis_worker.set_source(self._capture_worker)
         self._detection_worker.set_source(self._capture_worker)
         self._stream_mode = "live"
+        self._is_stream_frozen = False
         self.control_bar.set_stream_mode(self._stream_mode)
-        self._flagged_track_ids = set()
+        self._update_signal_card()
+        self._flagged_track_ids = OrderedDict()
         self._update_detection_enabled()
         self.control_bar.set_recording_baseline(self.dataset_exporter.is_recording_baseline, "live")
         self._launch_capture(device)
@@ -409,6 +446,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     @Slot(int, int, float, str)
     def _on_capture_source_opened(self, width: int, height: int, fps: float, backend: str) -> None:
+        self._stream_mode = "live"
+        self._is_stream_frozen = False
+        self.control_bar.set_stream_mode(self._stream_mode)
+        self._update_signal_card()
         self.pipeline.update_target_resolution(width, height)
         override = self.settings.get("capture_resolution_override")
         override_rejected = override is not None and (
@@ -482,30 +523,34 @@ class MainWindow(QMainWindow):
 
         associated_track_id = event.telemetry_data.get("associated_track_id")
         if associated_track_id is not None:
-            self._flagged_track_ids.add(associated_track_id)
+            self._flagged_track_ids[associated_track_id] = None
+            self._flagged_track_ids.move_to_end(associated_track_id)
+            if len(self._flagged_track_ids) > _MAX_FLAGGED_TRACK_IDS:
+                self._flagged_track_ids.popitem(last=False)
 
         if self._event_count == 1:
             self.incident_collapse_label.hide()
             self.incident_queue_table.show()
+            self.incidents_drawer.setMaximumWidth(320)
             sizes = self.body_splitter.sizes()
             sizes[2] = 320
             self.body_splitter.setSizes(sizes)
 
     def _on_telemetry_updated(self, telemetry: dict) -> None:
         self._latest_telemetry = telemetry
+        now = time.monotonic()
+        if now - self._last_signal_paint_time < (1.0 / 4.0):
+            return
+        self._last_signal_paint_time = now
         self._update_signal_card()
 
     def _update_signal_card(self) -> None:
         telemetry = self._latest_telemetry
-        straightness = telemetry.get("straightness")
-        tremor = telemetry.get("tremor_variance")
-        frozen = getattr(self, "_is_stream_frozen", False)
-        lines = [f"FREEZE: {'YES' if frozen else 'no'}"]
-        if straightness is not None:
-            lines.append(f"straightness: {float(straightness):.2f}")
-        if tremor is not None:
-            lines.append(f"tremor var: {float(tremor):.2f}")
-        self.signal_card.set_body("\n".join(lines))
+        straightness = float(telemetry.get("straightness") or 0.0)
+        tremor = float(telemetry.get("tremor_variance") or 0.0)
+        frozen = self._is_stream_frozen
+        status_token = "FREEZE" if frozen else "ok"
+        self.signal_card.set_body(f"{status_token} · str {straightness:.2f} · tremor {tremor:.1f}")
 
     # ------------------------------------------------------------------
     # Status text helpers
@@ -531,6 +576,11 @@ class MainWindow(QMainWindow):
     def _render_frame(self, source: CaptureWorker | PlaybackWorker | None, frame_id: int) -> None:
         if source is None or frame_id == self._last_rendered_frame_id:
             return
+
+        now = time.monotonic()
+        if now - self._last_paint_time < (1.0 / 30.0):
+            return
+        self._last_paint_time = now
 
         ctx = source.get_latest_context()
         if ctx is None or ctx.frame_id != frame_id:

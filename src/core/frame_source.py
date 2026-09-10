@@ -79,6 +79,24 @@ _CALIBRATION_WARMUP_SEC = 1.0
 # still goes through the full two-phase hardware test below.
 _BANDWIDTH_CEILING_BYTES_PER_SEC = 545_000_000
 
+# Freeze detection: a stream is only "frozen" once consecutive downscaled
+# grayscale samples stay near-identical (mean absdiff below threshold) for a
+# sustained run of frames -- a single duplicated/dropped frame must never
+# trip this, only a real stuck signal.
+_FREEZE_ABSDIFF_THRESHOLD = 1.5
+_FREEZE_HOLD_FRAMES = 90
+_FREEZE_SAMPLE_MAX_WIDTH = 320
+
+
+def _freeze_sample(frame: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape[:2]
+    if width <= _FREEZE_SAMPLE_MAX_WIDTH:
+        return gray
+    scale = _FREEZE_SAMPLE_MAX_WIDTH / width
+    target_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    return cv2.resize(gray, target_size, interpolation=cv2.INTER_AREA)
+
 
 class FFmpegRawVideoCapture:
     def __init__(self, device_name: str, width: int, height: int, fps: int):
@@ -97,8 +115,8 @@ class FFmpegRawVideoCapture:
         self._frame_ready_event = threading.Event()
         self._stderr_thread: threading.Thread | None = None
         self._last_error_lines: deque[str] = deque(maxlen=20)
-        self._static_fingerprint: np.ndarray | None = None
-        self._static_since: float | None = None
+        self._freeze_sample: np.ndarray | None = None
+        self._freeze_hold_count = 0
         self._stream_frozen = False
         self._open()
 
@@ -176,17 +194,19 @@ class FFmpegRawVideoCapture:
             if len(raw) != self._frame_size:
                 break
             frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3)).copy()
-            fingerprint = frame[::16, ::16, 0]
-            now = time.time()
+            sample = _freeze_sample(frame)
             with self._lock:
-                if self._static_fingerprint is not None and np.array_equal(fingerprint, self._static_fingerprint):
-                    if self._static_since is None:
-                        self._static_since = now
-                    self._stream_frozen = (now - self._static_since) > 3.0
+                previous_sample = self._freeze_sample
+                if previous_sample is not None and previous_sample.shape == sample.shape:
+                    mean_diff = float(cv2.absdiff(sample, previous_sample).mean())
+                    if mean_diff < _FREEZE_ABSDIFF_THRESHOLD:
+                        self._freeze_hold_count += 1
+                    else:
+                        self._freeze_hold_count = 0
                 else:
-                    self._static_since = None
-                    self._stream_frozen = False
-                self._static_fingerprint = fingerprint
+                    self._freeze_hold_count = 0
+                self._stream_frozen = self._freeze_hold_count >= _FREEZE_HOLD_FRAMES
+                self._freeze_sample = sample
                 self._latest_frame = frame
                 self._latest_frame_seq += 1
             self._frame_ready_event.set()

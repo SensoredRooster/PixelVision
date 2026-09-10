@@ -12,6 +12,7 @@ TEXT_PRIMARY = "#E8F1F2"
 TEXT_MUTED = "#8AA0A6"
 ALERT = "#FF3B5C"
 WARNING = "#F5A623"
+VOD_ACCENT = "#E8B86D"
 
 CANVAS_IDLE_COLOR = "#0B1020"
 
@@ -92,21 +93,23 @@ QFrame#ChipGroup QPushButton {{
 QLabel#ModePill {{
     background-color: {PANEL_ALT};
     border: 1px solid {ACCENT_DIM};
-    border-radius: 8px;
-    padding: 2px 10px;
+    border-radius: 10px;
+    padding: 3px 10px;
     font-size: 10px;
     font-weight: bold;
     color: {TEXT_MUTED};
 }}
 
 QLabel#ModePill[mode="live"] {{
-    color: {ACCENT};
+    background-color: {ACCENT};
     border: 1px solid {ACCENT};
+    color: {BACKGROUND};
 }}
 
 QLabel#ModePill[mode="vod"] {{
-    color: {WARNING};
-    border: 1px solid {WARNING};
+    background-color: {VOD_ACCENT};
+    border: 1px solid {VOD_ACCENT};
+    color: {BACKGROUND};
 }}
 
 QSplitter::handle {{

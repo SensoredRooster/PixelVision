@@ -50,6 +50,14 @@ class PixelVisionLogger:
             handle.write(json.dumps(asdict(event)) + "\n")
 
 
+_FACECAM_ROI_FRACTIONS = (0.62, 0.42, 0.99, 0.82)
+
+
+def _default_facecam_roi(width: int, height: int) -> tuple[int, int, int, int]:
+    x0_frac, y0_frac, x1_frac, y1_frac = _FACECAM_ROI_FRACTIONS
+    return (int(width * x0_frac), int(height * y0_frac), int(width * x1_frac), int(height * y1_frac))
+
+
 class AntiCheatPipeline:
     def __init__(
         self,
@@ -89,7 +97,8 @@ class AntiCheatPipeline:
         )
         self.detector_has_result = False
         self.detection_corroboration_margin_px = detection_corroboration_margin_px
-        self.facecam_roi = tuple(facecam_roi) if facecam_roi else None
+        self._facecam_roi_explicit = facecam_roi is not None
+        self.facecam_roi = tuple(facecam_roi) if facecam_roi else _default_facecam_roi(*target_resolution)
         self._max_box_area_ratio = 0.35
         self._initialize_onnx_runtime()
 
@@ -129,12 +138,10 @@ class AntiCheatPipeline:
     def should_analyze_frame(self, frame_id: int) -> bool:
         return frame_id % self.analysis_stride == 0
 
-    def _is_excluded_region(self, x1: int, y1: int, x2: int, y2: int) -> bool:
+    def _is_excluded_region(self, x1: int, y1: int, x2: int, y2: int, cx: int, cy: int) -> bool:
         if self.facecam_roi is not None:
             rx1, ry1, rx2, ry2 = self.facecam_roi
-            overlap_x = min(x2, rx2) - max(x1, rx1)
-            overlap_y = min(y2, ry2) - max(y1, ry1)
-            if overlap_x > 0 and overlap_y > 0:
+            if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
                 return True
         return self.hud_masker.overlaps_masked_region(x1, y1, x2, y2)
 
@@ -173,7 +180,7 @@ class AntiCheatPipeline:
             cx_rescaled = int(cx * scale_x)
             cy_rescaled = int(cy * scale_y)
 
-            if self._is_excluded_region(x1_rescaled, y1_rescaled, x2_rescaled, y2_rescaled):
+            if self._is_excluded_region(x1_rescaled, y1_rescaled, x2_rescaled, y2_rescaled, cx_rescaled, cy_rescaled):
                 continue
             if self._exceeds_max_area(x1_rescaled, y1_rescaled, x2_rescaled, y2_rescaled, display_w, display_h):
                 continue
@@ -198,6 +205,8 @@ class AntiCheatPipeline:
 
     def update_target_resolution(self, width: int, height: int) -> None:
         self.hud_masker.set_target_resolution(width, height)
+        if not self._facecam_roi_explicit:
+            self.facecam_roi = _default_facecam_roi(width, height)
 
     def process_frame(self, frame_context: FrameContext) -> Optional[CheatEvent]:
         self.frame_counter += 1
