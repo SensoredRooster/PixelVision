@@ -84,6 +84,18 @@ class AimTrackerTest(unittest.TestCase):
         self.assertLessEqual(abs(point[0] - cx), 4)
         self.assertLessEqual(abs(point[1] - cy), 4)
 
+    def test_static_reticle_does_not_pin_scene_tracking(self) -> None:
+        analyzer = CrosshairKinematicsAnalyzer()
+        base = _textured_field(540, 960, seed=6)
+        cx, cy = 480, 270
+        for i in range(16):
+            shifted = np.roll(base, shift=8 * i, axis=1)
+            cv2.circle(shifted, (cx, cy), 4, 255, -1)
+            analyzer.update(_bgr_from_gray(shifted), timestamp=float(i))
+        self.assertIsNotNone(analyzer.last_metrics)
+        self.assertGreater(float(analyzer.last_metrics["velocity"]), 4.0)
+        self.assertGreater(float(analyzer.last_metrics["tremor_variance"]), 0.0)
+
     def test_aim_point_defaults_to_frame_center(self) -> None:
         analyzer = CrosshairKinematicsAnalyzer()
         gray = _textured_field(360, 640, seed=5)

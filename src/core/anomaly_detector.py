@@ -49,7 +49,6 @@ class CrosshairKinematicsAnalyzer:
         self.delta_history: deque[tuple[float, float]] = deque(maxlen=window_size)
         self.previous_roi: Optional[np.ndarray] = None
         self.previous_gray: Optional[np.ndarray] = None
-        self._hann_window: Optional[np.ndarray] = None
         self.zero_tremor_streak = 0
         self.last_metrics: dict[str, Any] | None = None
         self._lock = threading.Lock()
@@ -59,7 +58,6 @@ class CrosshairKinematicsAnalyzer:
             self.delta_history.clear()
             self.previous_roi = None
             self.previous_gray = None
-            self._hann_window = None
             self.zero_tremor_streak = 0
             self.last_metrics = None
 
@@ -70,6 +68,35 @@ class CrosshairKinematicsAnalyzer:
         x1 = max(0, (width - roi_w) // 2)
         y1 = max(0, (height - roi_h) // 2)
         return gray[y1 : y1 + roi_h, x1 : x1 + roi_w]
+
+    def _scene_delta(self, previous: np.ndarray, current: np.ndarray) -> tuple[float, float, float]:
+        height, width = previous.shape[:2]
+        band_h = max(16, height // 5)
+        band_w = max(16, width // 5)
+        bands = (
+            (previous[:band_h, :], current[:band_h, :]),
+            (previous[-band_h:, :], current[-band_h:, :]),
+            (previous[:, :band_w], current[:, :band_w]),
+            (previous[:, -band_w:], current[:, -band_w:]),
+        )
+        shifts_x: list[float] = []
+        shifts_y: list[float] = []
+        responses: list[float] = []
+        for prev_band, curr_band in bands:
+            if prev_band.shape[0] < 8 or prev_band.shape[1] < 8:
+                continue
+            window = cv2.createHanningWindow((prev_band.shape[1], prev_band.shape[0]), cv2.CV_32F)
+            shift, response = cv2.phaseCorrelate(
+                prev_band.astype(np.float32),
+                curr_band.astype(np.float32),
+                window,
+            )
+            shifts_x.append(float(shift[0]))
+            shifts_y.append(float(shift[1]))
+            responses.append(float(response))
+        if not responses:
+            return 0.0, 0.0, 0.0
+        return float(np.median(shifts_x)), float(np.median(shifts_y)), float(np.median(responses))
 
     def _refine_reticle(self, gray: np.ndarray) -> tuple[int, int]:
         """Prefer a small bright mark at center (dot/plus); else geometric center."""
@@ -129,31 +156,22 @@ class CrosshairKinematicsAnalyzer:
             if self.previous_roi is None or self.previous_roi.shape != roi.shape:
                 self.previous_gray = frame_gray.copy()
                 self.previous_roi = roi.copy()
-                self._hann_window = cv2.createHanningWindow((roi.shape[1], roi.shape[0]), cv2.CV_32F)
                 self.delta_history.clear()
                 self.zero_tremor_streak = 0
                 self.last_metrics = self._idle_metrics(point)
                 return None
 
-            if self._hann_window is None or self._hann_window.shape != roi.shape:
-                self._hann_window = cv2.createHanningWindow((roi.shape[1], roi.shape[0]), cv2.CV_32F)
-
-            shift, response = cv2.phaseCorrelate(
-                self.previous_roi.astype(np.float32),
-                roi.astype(np.float32),
-                self._hann_window,
-            )
+            scene_dx, scene_dy, response = self._scene_delta(self.previous_roi, roi)
             self.previous_gray = frame_gray.copy()
             self.previous_roi = roi.copy()
-            response = float(response)
 
             if response < self.min_phase_response:
                 self.last_metrics = self._idle_metrics(point, {"flow_response": response})
                 return None
 
             # Scene translation under a fixed reticle => camera/aim moved the other way.
-            dx = -float(shift[0])
-            dy = -float(shift[1])
+            dx = -scene_dx
+            dy = -scene_dy
             self.delta_history.append((dx, dy))
 
             if len(self.delta_history) < 4:
@@ -175,7 +193,9 @@ class CrosshairKinematicsAnalyzer:
             straightness = float(displacement / total_path_length) if total_path_length > 0.0 else 1.0
 
             residuals = self._line_residuals(coords)
-            tremor_variance = float(np.var(residuals))
+            residual_var = float(np.var(residuals))
+            step_var = float(np.mean(np.var(deltas, axis=0))) if len(deltas) else 0.0
+            tremor_variance = max(residual_var, step_var)
             mean_velocity = float(np.mean(step_distances))
             max_step = float(np.max(step_distances))
 

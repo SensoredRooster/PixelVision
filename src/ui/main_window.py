@@ -600,7 +600,7 @@ class MainWindow(QMainWindow):
         tremor = float(telemetry.get("tremor_variance") or 0.0)
         frozen = self._is_stream_frozen
         status_token = "FREEZE" if frozen else "ok"
-        self.signal_card.set_body(f"{status_token} · str {straightness:.2f} · tremor {tremor:.1f}")
+        self.signal_card.set_body(f"{status_token} · str {straightness:.2f} · tremor {tremor:.2f}")
 
     # ------------------------------------------------------------------
     # Status text helpers

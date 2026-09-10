@@ -13,6 +13,7 @@ venv/
 # Local recordings and session output — not source.
 data/clean/
 data/suspicious/
+data/raw/
 data/logs/
 logs/
 startup_crash.log
