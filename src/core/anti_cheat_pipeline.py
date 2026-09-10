@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -10,7 +9,6 @@ from typing import Any, Optional
 
 import cv2
 import numpy as np
-import onnxruntime as ort
 
 from src.core.anomaly_detector import CrosshairKinematicsAnalyzer
 from src.core.dataset_exporter import PixelVisionDatasetExporter
@@ -119,10 +117,6 @@ class AntiCheatPipeline:
         stream_chat_ignore: bool = True,
     ):
         self.logger = PixelVisionLogger(log_dir=log_dir)
-        self.model_path = model_path
-        self.ort_session = None
-        self.yolo_model_ready = False
-        self.yolo_model_error: Optional[str] = None
         self.hud_masker = WarzoneHUDMasker(target_resolution=target_resolution)
         self.crosshair_analyzer = CrosshairKinematicsAnalyzer()
         self.analysis_stride = max(1, int(analysis_stride))
@@ -155,29 +149,10 @@ class AntiCheatPipeline:
         self._content_frac = (0.0, 0.0, 1.0, 1.0)
         self._max_box_area_ratio = 0.35
         self.set_source_profile(source_profile)
-        self._initialize_onnx_runtime()
 
     @property
     def detector_ready(self) -> bool:
         return self.player_detector.ort_session is not None
-
-    def _initialize_onnx_runtime(self) -> None:
-        if not os.path.exists(self.model_path):
-            self.yolo_model_ready = False
-            self.yolo_model_error = f"Model not found: {self.model_path}"
-            print(f"[PIPELINE] [INFO] ONNX model not found at {self.model_path}.")
-            return
-
-        try:
-            self.ort_session = ort.InferenceSession(self.model_path, providers=["CPUExecutionProvider"])
-            self.yolo_model_ready = True
-            self.yolo_model_error = None
-            print(f"[PIPELINE] [SUCCESS] Live ONNX Inference block loaded: {self.model_path}")
-        except Exception as exc:
-            self.ort_session = None
-            self.yolo_model_ready = False
-            self.yolo_model_error = str(exc)
-            print(f"[PIPELINE] [ERROR] Failed initialization of ONNX Runtime session: {exc}")
 
     def _check_duplicate(self, current_frame: np.ndarray) -> bool:
         small = cv2.resize(current_frame, (16, 16), interpolation=cv2.INTER_NEAREST)

@@ -1,18 +1,20 @@
 # PixelVision dataset storage
 
-Use this folder to store gameplay clips, labels, and notes for building your anti-cheat model.
+Gameplay clips, labels, and notes for reviewing and (optionally) training.
 
 ## Structure
 
-- `raw/` – original recordings or clips before labeling
-- `clean/` – normal gameplay examples
-- `suspicious/` – suspected cheating gameplay examples
-- `labels/` – exported label files or JSON metadata
-- `notes/` – human notes, screenshots, and review logs
+- `raw/` – original recordings before labeling
+- `clean/` – normal gameplay (gitignored)
+- `suspicious/` – suspected cheating gameplay (gitignored)
+- `labels/` – JSON metadata
+- `logs/` – session JSONL/CSV from the review console (gitignored)
+- `models/` – local ONNX weights (gitignored; see `models/README.md`)
+- `notes/` – human notes
 
 ## Manifest format
 
-Use the file `manifest.csv` to track each clip. Add one row per file.
+Use `manifest.csv` to track each clip. One row per file.
 
 Required columns:
 - filename
@@ -28,7 +30,5 @@ Required columns:
 ## Example values
 
 - label: clean, aimbot, wallhack, esp, speedhack, macro, unknown
-- game: Valorant, Apex, CS2, Fortnite, etc.
+- game: Warzone, Valorant, Apex, CS2, Fortnite, etc.
 - mode: ranked, casual, scrim, training
-
-Keep clips organized by label and game so it's easier to train and validate on real examples.

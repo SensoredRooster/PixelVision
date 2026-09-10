@@ -1,82 +1,87 @@
 # PixelVision
 
-PixelVision is a Windows desktop computer vision anti-cheat starter project built in Python.
+Windows review console for FPS gameplay. It watches a capture card, webcam,
+monitor, or mounted VOD and flags aim that looks mechanical: perfectly straight
+camera pans and high-speed locks with no tremor.
 
-## Overview
+This is a **spectator / VOD tool**. It does not inject into a game.
 
-This project provides a lightweight foundation for:
-- webcam capture
-- motion and anomaly detection
-- event logging
-- a clean desktop interface for monitoring activity
+## What it does
 
-The goal is to give you a practical starting point for a security or competitive-play monitoring system without locking you into a rigid architecture.
-
-## Features
-
-- Real-time webcam feed
-- Basic motion detection using OpenCV
-- Local event logging for suspicious activity
-- Configurable thresholds via JSON settings
-- Desktop UI built with CustomTkinter
-
-## Project layout
-
-- `main.py` – app entry point
-- `src/app.py` – app bootstrap
-- `src/core/anomaly_detector.py` – motion/anomaly logic
-- `src/core/event_logger.py` – local logging helper
-- `src/ui/main_window.py` – desktop UI
-- `config/settings.json` – default configuration
+- Live capture from DirectShow devices (webcam vs capture card, auto-labeled)
+- ffmpeg(dshow) mode calibration so HDMI cards don't freeze from a too-fast mode
+- VOD playback with seek-to-incident
+- Source profiles: HDMI game, stream window (ignores chat / facecam / chrome), VOD file
+- Aim scoring via phase correlation under the reticle (not a moving-sprite tracker)
+- Optional YOLO player boxes to corroborate a flag (off in LIVE unless you opt in)
+- Local JSONL event logs and optional clean-baseline / flagged-clip export
 
 ## Setup
 
-1. Create and activate a virtual environment.
-2. Install requirements:
-
 ```bash
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-3. Run the app:
-
-```bash
 python main.py
 ```
 
-If a mounted gameplay clip has the wrong playback speed, add an optional
-`playback_fps` value to `config/settings.json` and set it to the clip's real FPS.
-Use `0` to keep auto-detection.
+ffmpeg must be on `PATH` for capture-card input.
 
-## Feeding gameplay into the app
+### Player detector (optional)
 
-The app can watch either:
-- a webcam (`capture_mode: "camera"`), or
-- a game screen / monitor (`capture_mode: "screen"`)
+YOLO is off for live desktop capture by default. To enable it on VOD, or on live
+with **Analyze this display anyway**:
 
-When camera mode is active, the input dropdown auto-labels discovered devices as
-`Webcam` or `Capture Card` based on the DirectShow device name so your webcam and
-capture card stay separate in the selector.
+1. Export a YOLOv8/v11 ONNX file (COCO `person` = class 0 works as a starting point;
+   a game-tuned model is better):
 
-To monitor gameplay, edit `config/settings.json` and set:
+   ```bash
+   pip install ultralytics
+   yolo export model=yolov8n.pt format=onnx imgsz=640
+   ```
 
-```json
-{
-  "capture_mode": "screen",
-  "screen_monitor_index": 1,
-  "screen_region": [0, 0, 1920, 1080]
-}
+2. Copy `yolov8n.onnx` to `data/models/yolov8n.onnx`.
+
+Weights are not stored in git.
+
+## Capture
+
+Edit `config/settings.json`:
+
+| Key | Meaning |
+|---|---|
+| `capture_mode` | `camera` or `screen` |
+| `source_profile` | `hdmi_game`, `stream_window`, or `vod_file` |
+| `capture_width` / `capture_height` / `capture_fps` | Requested mode; AUTO in the UI lets the card calibrate |
+| `player_detector_model_path` | ONNX detector, default `data/models/yolov8n.onnx` |
+| `facecam_roi` | Empty = default bottom-right facecam ignore box |
+
+HDMI gameplay: `source_profile: "hdmi_game"`. Twitch/YouTube window: `stream_window`
+so chat, title bar, and facecam are ignored.
+
+If a mounted clip plays at the wrong speed, set `playback_fps` to the real FPS
+(`0` = auto).
+
+## Layout
+
+- `main.py` — entry
+- `src/app.py` — Qt bootstrap
+- `src/core/frame_source.py` — camera / screen / ffmpeg capture
+- `src/core/anti_cheat_pipeline.py` — scene gates, HUD mask, corroboration
+- `src/core/anomaly_detector.py` — reticle + phase-correlation aim scoring
+- `src/core/object_detector.py` — optional YOLO + IOU tracker
+- `src/ui/main_window.py` — review console
+- `config/settings.json` — defaults
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
 ```
 
-How this works:
-- `screen_monitor_index` selects the display to monitor.
-- `screen_region` optionally crops the image to just the gameplay window instead of the whole monitor.
-- Each captured frame is then processed by the motion detector and logged as an event if it passes the configured motion threshold.
+## Training (optional)
 
-For a game window only, use `screen_region` with the exact coordinates of the game client. You can usually get those dimensions from Windows display settings or by using a tool that reads window bounds.
-
-## Notes
-
-- Use this as a starting point for a privacy-conscious monitoring workflow.
-- Keep logs local and review access policies carefully.
-- Expand detection logic with object recognition, face tracking, or screen-based checks as your needs grow.
+`src/core/train_workflow.py` fits a small classifier on clip-level aim features
+(velocity, straightness, tremor, snap size) from `data/clean/` vs
+`data/suspicious/`. It does **not** train on the rule engine's own flags.
+Torch is only required for this path.
