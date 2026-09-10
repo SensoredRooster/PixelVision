@@ -8,6 +8,15 @@ import numpy as np
 
 from src.core.anti_cheat_pipeline import AntiCheatPipeline, FrameContext
 
+_FEATURE_KEYS = (
+    "velocity",
+    "straightness",
+    "tremor_variance",
+    "zero_tremor_streak",
+    "flow_response",
+    "max_step",
+)
+
 
 class PixelVisionDatasetProcessor:
     def __init__(self, target_resolution: tuple[int, int] = (2560, 1440)):
@@ -34,30 +43,47 @@ class PixelVisionDatasetProcessor:
                 break
 
             frame_id += 1
+            analysis = cv2.resize(frame, (960, 540))
 
-            if frame.shape[1] != self.target_res[0] or frame.shape[0] != self.target_res[1]:
-                frame = cv2.resize(frame, self.target_res)
-
-            flagged_event = self.pipeline.process_frame(
+            self.pipeline.process_frame(
                 frame_context=FrameContext(
                     frame=frame,
                     timestamp=float(frame_id),
                     frame_id=frame_id,
                     source=f"dataset_{label_type}",
                     is_duplicate=False,
+                    analysis_frame=analysis,
                 ),
             )
-
-            current_metrics = {
-                "frame_id": frame_id,
-                "label": 1 if label_type == "suspicious" else 0,
-                "flagged_by_rules": 1 if flagged_event else 0,
-                "confidence_score": flagged_event.confidence_score if flagged_event else 0.0,
-            }
-            clip_telemetry_history.append(current_metrics)
+            metrics = self.pipeline.crosshair_analyzer.last_metrics or {}
+            clip_telemetry_history.append(
+                {
+                    "frame_id": frame_id,
+                    "label": 1 if label_type == "suspicious" else 0,
+                    **{key: float(metrics.get(key, 0.0) or 0.0) for key in _FEATURE_KEYS},
+                }
+            )
 
         cap.release()
         return clip_telemetry_history
+
+    def clip_feature_vector(self, history: list[dict[str, Any]]) -> list[float] | None:
+        if not history:
+            return None
+        velocities = [row["velocity"] for row in history]
+        straightness = [row["straightness"] for row in history]
+        tremor = [row["tremor_variance"] for row in history]
+        streaks = [row["zero_tremor_streak"] for row in history]
+        responses = [row["flow_response"] for row in history]
+        steps = [row["max_step"] for row in history]
+        return [
+            float(max(velocities)),
+            float(max(straightness)),
+            float(min(tremor) if tremor else 0.0),
+            float(max(streaks)),
+            float(max(responses)),
+            float(max(steps)),
+        ]
 
 
 class AntiCheatMLDatasetLoader:
@@ -81,12 +107,14 @@ class AntiCheatMLDatasetLoader:
 
                 path = os.path.join(directory, file)
                 metrics = self.processor.process_clip_to_frames(path, label_type=label_name)
-                for entry in metrics:
-                    features_matrix.append([float(entry["flagged_by_rules"]), float(entry["confidence_score"])])
-                    labels_vector.append(int(entry["label"]))
+                vector = self.processor.clip_feature_vector(metrics)
+                if vector is None:
+                    continue
+                features_matrix.append(vector)
+                labels_vector.append(1 if label_name == "suspicious" else 0)
 
         if not features_matrix:
-            return np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.int64)
+            return np.empty((0, len(_FEATURE_KEYS)), dtype=np.float32), np.empty((0,), dtype=np.int64)
 
         return np.array(features_matrix, dtype=np.float32), np.array(labels_vector, dtype=np.int64)
 
@@ -102,9 +130,9 @@ if __name__ == "__main__":
     print("\n=====================================================================")
     print("                      DATASET PROCESSING SUMMARY                     ")
     print("=====================================================================")
-    print(f"Total Structural Frame Profiles Loaded (X Shape): {x.shape}")
-    print(f"Total Categorical Ground Labels Compiled (y Shape): {y.shape}")
+    print(f"Total clips loaded (X shape): {x.shape}")
+    print(f"Labels (y shape): {y.shape}")
     if len(y) > 0:
-        print(f" -> Total Suspicious Malicious Target Frames Found: {np.sum(y == 1)}")
-        print(f" -> Total Clean Validated Reference Frames Found: {np.sum(y == 0)}")
+        print(f" -> Suspicious clips: {np.sum(y == 1)}")
+        print(f" -> Clean clips: {np.sum(y == 0)}")
     print("=====================================================================\n")

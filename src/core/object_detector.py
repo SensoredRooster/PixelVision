@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import cv2
@@ -15,7 +16,7 @@ class PixelVisionObjectDetector:
         nms_threshold: float = 0.45,
         player_class_ids: list[int] | None = None,
     ):
-        self.model_path = model_path
+        self.model_path = self._resolve_model_path(model_path)
         self.conf_threshold = conf_threshold
         self.nms_threshold = nms_threshold
         self.player_class_ids = player_class_ids if player_class_ids is not None else []
@@ -31,6 +32,24 @@ class PixelVisionObjectDetector:
         self._model_warning_emitted = False
         self._output_layout: str | None = None
         self._load_onnx_model()
+
+    @staticmethod
+    def _resolve_model_path(model_path: str) -> str:
+        candidates = [
+            model_path,
+            "data/models/yolov8n.onnx",
+            "data/models/yolov8n_gaming.onnx",
+            "config/models/yolov8n.onnx",
+            "yolov8n.onnx",
+        ]
+        seen: set[str] = set()
+        for path in candidates:
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            if os.path.isfile(path):
+                return path
+        return model_path
 
     def _load_onnx_model(self) -> None:
         try:

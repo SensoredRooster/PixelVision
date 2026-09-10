@@ -31,10 +31,8 @@ def export_yolo_to_onnx(weights_path: str = "data/models/yolov8n_gaming.pt") -> 
         print(f"[EXPORT] SUCCESS: ONNX serialization fully written -> {onnx_path}")
         return True
     except ImportError:
-        print("[EXPORT] 'ultralytics' backend engine missing. Simulating fallback dummy ONNX validation model structure.")
-        with open(onnx_path, "w", encoding="utf-8") as handle:
-            handle.write("FALLBACK_DUMMY_ONNX_BLOB_FOR_INTEGRATION_SMOKE_TESTS")
-        return True
+        print("[EXPORT] 'ultralytics' is not installed. Skipping ONNX export.")
+        return False
     except Exception as exc:
         print(f"[EXPORT] Process Exception encountered during model architecture compile: {exc}")
         return False

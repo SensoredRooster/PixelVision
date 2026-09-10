@@ -12,7 +12,7 @@
   "log_directory": "logs",
   "window_title": "PixelVision",
   "detection_fps": 30,
-  "player_detector_model_path": "data/models/yolov8n_gaming.onnx",
+  "player_detector_model_path": "data/models/yolov8n.onnx",
   "detection_confidence_threshold": 0.45,
   "detection_nms_threshold": 0.45,
   "detection_player_class_ids": [0],

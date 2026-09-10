@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -10,11 +9,10 @@ from typing import Any, Optional
 
 import cv2
 import numpy as np
-import onnxruntime as ort
 
 from src.core.anomaly_detector import CrosshairKinematicsAnalyzer
 from src.core.dataset_exporter import PixelVisionDatasetExporter
-from src.core.hud_masker import WarzoneHUDMasker
+from src.core.hud_masker import WarzoneHUDMasker, scale_bbox, scale_point
 from src.core.object_detector import PixelVisionObjectDetector
 
 
@@ -119,10 +117,6 @@ class AntiCheatPipeline:
         stream_chat_ignore: bool = True,
     ):
         self.logger = PixelVisionLogger(log_dir=log_dir)
-        self.model_path = model_path
-        self.ort_session = None
-        self.yolo_model_ready = False
-        self.yolo_model_error: Optional[str] = None
         self.hud_masker = WarzoneHUDMasker(target_resolution=target_resolution)
         self.crosshair_analyzer = CrosshairKinematicsAnalyzer()
         self.analysis_stride = max(1, int(analysis_stride))
@@ -144,6 +138,8 @@ class AntiCheatPipeline:
         self.detection_corroboration_margin_px = detection_corroboration_margin_px
         self._facecam_roi_explicit = facecam_roi is not None
         self._target_resolution = target_resolution
+        self._analysis_size: tuple[int, int] = target_resolution
+        self._display_size: tuple[int, int] = target_resolution
         self._facecam_frac = _normalize_facecam_frac(facecam_roi, *target_resolution)
         self.facecam_roi = _frac_to_pixels(*target_resolution, self._facecam_frac)
         self._stream_chat_ignore = bool(stream_chat_ignore)
@@ -153,29 +149,10 @@ class AntiCheatPipeline:
         self._content_frac = (0.0, 0.0, 1.0, 1.0)
         self._max_box_area_ratio = 0.35
         self.set_source_profile(source_profile)
-        self._initialize_onnx_runtime()
 
     @property
     def detector_ready(self) -> bool:
         return self.player_detector.ort_session is not None
-
-    def _initialize_onnx_runtime(self) -> None:
-        if not os.path.exists(self.model_path):
-            self.yolo_model_ready = False
-            self.yolo_model_error = f"Model not found: {self.model_path}"
-            print(f"[PIPELINE] [INFO] ONNX model not found at {self.model_path}.")
-            return
-
-        try:
-            self.ort_session = ort.InferenceSession(self.model_path, providers=["CPUExecutionProvider"])
-            self.yolo_model_ready = True
-            self.yolo_model_error = None
-            print(f"[PIPELINE] [SUCCESS] Live ONNX Inference block loaded: {self.model_path}")
-        except Exception as exc:
-            self.ort_session = None
-            self.yolo_model_ready = False
-            self.yolo_model_error = str(exc)
-            print(f"[PIPELINE] [ERROR] Failed initialization of ONNX Runtime session: {exc}")
 
     def _check_duplicate(self, current_frame: np.ndarray) -> bool:
         small = cv2.resize(current_frame, (16, 16), interpolation=cv2.INTER_NEAREST)
@@ -200,7 +177,7 @@ class AntiCheatPipeline:
             for x0, y0, x1f, y1f in self._ignore_fracs:
                 if x0 <= nx <= x1f and y0 <= ny <= y1f:
                     return True
-        return self.hud_masker.overlaps_masked_region(x1, y1, x2, y2)
+        return self.hud_masker.overlaps_masked_region(x1, y1, x2, y2, width=width, height=height)
 
     @property
     def source_profile(self) -> str:
@@ -281,45 +258,38 @@ class AntiCheatPipeline:
     def update_detected_entities(
         self, entities: list[dict[str, Any]], analysis_frame_shape: tuple[int, ...], display_frame_shape: tuple[int, ...]
     ) -> None:
+        """Store YOLO boxes in *analysis* space. Overlay code asks get_tracked_entities()
+        for display-space copies. Corroboration reads analysis-space boxes so they
+        line up with kinematics running on the same analysis frame.
+        """
+        analysis_h, analysis_w = analysis_frame_shape[:2]
+        display_h, display_w = display_frame_shape[:2]
+        self._analysis_size = (analysis_w, analysis_h)
+        self._display_size = (display_w, display_h)
+
         if not entities:
             with self._entities_lock:
                 self.last_tracked_entities = []
                 self.detector_has_result = True
             return
 
-        analysis_h, analysis_w = analysis_frame_shape[:2]
-        display_h, display_w = display_frame_shape[:2]
-
-        scale_x = display_w / analysis_w if analysis_w > 0 else 1.0
-        scale_y = display_h / analysis_h if analysis_h > 0 else 1.0
-
         rescaled_entities: list[dict[str, Any]] = []
         for entity in entities:
             bbox = entity.get("bbox", (0, 0, 0, 0))
             center = entity.get("center", (0, 0))
-
             x1, y1, x2, y2 = bbox
             cx, cy = center
 
-            x1_rescaled = int(x1 * scale_x)
-            y1_rescaled = int(y1 * scale_y)
-            x2_rescaled = int(x2 * scale_x)
-            y2_rescaled = int(y2 * scale_y)
-            cx_rescaled = int(cx * scale_x)
-            cy_rescaled = int(cy * scale_y)
-
-            if self._is_excluded_region(
-                x1_rescaled, y1_rescaled, x2_rescaled, y2_rescaled, cx_rescaled, cy_rescaled, display_w, display_h
-            ):
+            if self._is_excluded_region(x1, y1, x2, y2, cx, cy, analysis_w, analysis_h):
                 continue
-            if self._exceeds_max_area(x1_rescaled, y1_rescaled, x2_rescaled, y2_rescaled, display_w, display_h):
+            if self._exceeds_max_area(x1, y1, x2, y2, analysis_w, analysis_h):
                 continue
 
             rescaled_entities.append(
                 {
                     "track_id": entity.get("track_id", -1),
-                    "bbox": (x1_rescaled, y1_rescaled, x2_rescaled, y2_rescaled),
-                    "center": (cx_rescaled, cy_rescaled),
+                    "bbox": (int(x1), int(y1), int(x2), int(y2)),
+                    "center": (int(cx), int(cy)),
                     "confidence": entity.get("confidence", 0.0),
                     "class_id": entity.get("class_id", -1),
                 }
@@ -330,11 +300,33 @@ class AntiCheatPipeline:
             self.detector_has_result = True
 
     def get_tracked_entities(self) -> list[dict[str, Any]]:
+        """Display-space copies for overlay painting."""
+        with self._entities_lock:
+            entities = list(self.last_tracked_entities)
+        analysis_size = self._analysis_size
+        display_size = self._display_size
+        if analysis_size == display_size:
+            return entities
+        scaled: list[dict[str, Any]] = []
+        for entity in entities:
+            bbox = entity.get("bbox", (0, 0, 0, 0))
+            center = entity.get("center", (0, 0))
+            scaled.append(
+                {
+                    **entity,
+                    "bbox": scale_bbox(bbox, analysis_size, display_size),
+                    "center": scale_point(center, analysis_size, display_size),
+                }
+            )
+        return scaled
+
+    def get_analysis_entities(self) -> list[dict[str, Any]]:
         with self._entities_lock:
             return list(self.last_tracked_entities)
 
     def update_target_resolution(self, width: int, height: int) -> None:
         self._target_resolution = (width, height)
+        self._display_size = (width, height)
         self.hud_masker.set_target_resolution(width, height)
         if not self._facecam_roi_explicit:
             self._facecam_frac = _FACECAM_ROI_FRACTIONS
@@ -342,7 +334,13 @@ class AntiCheatPipeline:
 
     def process_frame(self, frame_context: FrameContext) -> Optional[CheatEvent]:
         self.frame_counter += 1
-        source_frame = frame_context.analysis_frame if frame_context.analysis_frame is not None else frame_context.frame
+        display_frame = frame_context.frame
+        source_frame = frame_context.analysis_frame if frame_context.analysis_frame is not None else display_frame
+        analysis_h, analysis_w = source_frame.shape[:2]
+        display_h, display_w = display_frame.shape[:2]
+        self._analysis_size = (analysis_w, analysis_h)
+        self._display_size = (display_w, display_h)
+
         skip_reason = self._scene_skip_reason(source_frame)
         if skip_reason:
             self.crosshair_analyzer.reset()
@@ -360,6 +358,8 @@ class AntiCheatPipeline:
         self.last_telemetry_snapshot = dict(self.crosshair_analyzer.last_metrics or self._idle_telemetry())
         self.last_telemetry_snapshot["source_profile"] = self._source_profile
         self.last_telemetry_snapshot["ignore_rect_count"] = self.ignore_rect_count
+        self.last_telemetry_snapshot["analysis_size"] = [analysis_w, analysis_h]
+        self.last_telemetry_snapshot["display_size"] = [display_w, display_h]
         if not metrics or not metrics.get("flagged"):
             self.last_event_type = None
             self.last_mechanical_lock_detected = False
@@ -375,10 +375,11 @@ class AntiCheatPipeline:
             detector_has_result = self.detector_has_result
             tracked_entities_snapshot = list(self.last_tracked_entities)
 
-        if self.detector_ready and detector_has_result:
-            crosshair_point = metrics.get("point", (0, 0))
-            px, py = crosshair_point
+        analysis_point = metrics.get("point", (0, 0))
+        px, py = analysis_point
+        display_point = scale_point((px, py), (analysis_w, analysis_h), (display_w, display_h))
 
+        if self.detector_ready and detector_has_result:
             best_match = None
             best_confidence = 0.0
 
@@ -412,7 +413,8 @@ class AntiCheatPipeline:
             cheat_category=self.last_event_type,
             confidence_score=float(metrics.get("confidence", 0.0)),
             telemetry_data={
-                "crosshair_point": list(metrics.get("point", (0, 0))),
+                "crosshair_point": list(analysis_point),
+                "crosshair_point_display": list(display_point),
                 "velocity": float(metrics.get("velocity", 0.0)),
                 "straightness": float(metrics.get("straightness", 0.0)),
                 "tremor_variance": float(metrics.get("tremor_variance", 0.0)),
@@ -422,6 +424,8 @@ class AntiCheatPipeline:
                 "associated_track_id": associated_track_id,
                 "source_profile": self._source_profile,
                 "ignore_rect_count": self.ignore_rect_count,
+                "analysis_size": [analysis_w, analysis_h],
+                "display_size": [display_w, display_h],
             },
         )
         self.logger.commit(event)

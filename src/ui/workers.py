@@ -51,7 +51,7 @@ class CaptureWorker(QObject):
         self._lock = threading.Lock()
         self._latest_context: FrameContext | None = None
         self._frame_sequence = 0
-        self._recent_frame_cache: deque[np.ndarray] = deque(maxlen=1)
+        self._recent_frame_cache: deque[np.ndarray] = deque(maxlen=60)
         self._live_frame_timestamps: deque[float] = deque(maxlen=180)
         self._ffmpeg_capture: FFmpegRawVideoCapture | None = None
         self._frame_signal_pending = False
@@ -142,9 +142,10 @@ class CaptureWorker(QObject):
         return width, height, fps
 
     def _publish_latest(self, context: FrameContext) -> None:
+        preview = _downscale(context.frame, 960, 540)
         with self._lock:
             self._latest_context = context
-            self._recent_frame_cache.append(context.frame)
+            self._recent_frame_cache.append(preview)
             emit_now = not self._frame_signal_pending
             if emit_now:
                 self._frame_signal_pending = True

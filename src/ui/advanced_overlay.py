@@ -63,6 +63,11 @@ class PixelVisionAdvancedOverlayEngine:
         if is_flagged:
             self.log_event(flagged_event.frame_id, flagged_event.cheat_category, flagged_event.confidence_score)
 
+        frame_h, frame_w = raw_frame.shape[:2]
+        if self.heatmap_accumulator.shape[:2] != (frame_h, frame_w):
+            self.heatmap_accumulator = np.zeros((frame_h, frame_w), dtype=np.float32)
+            self.width, self.height = frame_w, frame_h
+
         if mode == "flagged_only":
             display_canvas = self._generate_flagged_view(raw_frame, tracked_entities, flagged_track_ids or set())
         elif mode == "heatmap":

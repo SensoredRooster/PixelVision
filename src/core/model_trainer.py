@@ -18,7 +18,7 @@ from src.core.dataset_loader import AntiCheatMLDatasetLoader
 
 
 class PixelVisionClassifier(nn.Module):
-    def __init__(self, input_dim: int = 2):
+    def __init__(self, input_dim: int = 6):
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(input_dim, 16),
@@ -96,8 +96,16 @@ if __name__ == "__main__":
     X, y = dataset_loader.compile_training_tensors()
 
     if len(X) == 0:
-        print("[WARNING] No local clips found. Simulating synthetic baseline data arrays for pipeline check...")
-        X = np.array([[0, 0.0], [0, 0.0], [1, 0.95], [1, 0.88]], dtype=np.float32)
+        print("[WARNING] No local clips found. Simulating synthetic clip-level features for a pipeline check...")
+        X = np.array(
+            [
+                [4.0, 0.72, 3.5, 0.0, 0.4, 6.0],
+                [5.0, 0.68, 4.1, 0.0, 0.5, 7.0],
+                [22.0, 0.99, 0.1, 4.0, 0.8, 31.0],
+                [19.0, 0.98, 0.2, 3.0, 0.7, 29.0],
+            ],
+            dtype=np.float32,
+        )
         y = np.array([0, 0, 1, 1], dtype=np.int64)
 
     trainer = AntiCheatModelTrainer()

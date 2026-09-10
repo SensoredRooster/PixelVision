@@ -10,5 +10,14 @@ venv/
 .idea/
 .vscode/
 
-# Local baseline/session video recordings - large binary test output, not source.
+# Local recordings and session output — not source.
 data/clean/
+data/suspicious/
+data/logs/
+logs/
+startup_crash.log
+
+# Model weights are downloaded locally. See data/models/README.md.
+*.pt
+*.onnx
+*.onnx.data
