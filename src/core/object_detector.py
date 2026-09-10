@@ -11,7 +11,7 @@ import onnxruntime as ort
 class PixelVisionObjectDetector:
     def __init__(
         self,
-        model_path: str = "data/models/yolov8n_gaming.onnx",
+        model_path: str = "data/models/yolov8n.onnx",
         conf_threshold: float = 0.45,
         nms_threshold: float = 0.45,
         player_class_ids: list[int] | None = None,
@@ -38,9 +38,6 @@ class PixelVisionObjectDetector:
         candidates = [
             model_path,
             "data/models/yolov8n.onnx",
-            "data/models/yolov8n_gaming.onnx",
-            "config/models/yolov8n.onnx",
-            "yolov8n.onnx",
         ]
         seen: set[str] = set()
         for path in candidates:

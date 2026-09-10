@@ -103,11 +103,10 @@ class AntiCheatPipeline:
     def __init__(
         self,
         log_dir: str = "logs",
-        model_path: str = "data/models/pixelvision_detector.onnx",
         analysis_stride: int = 3,
         dataset_exporter: PixelVisionDatasetExporter | None = None,
         target_resolution: tuple[int, int] = (2560, 1440),
-        player_detector_model_path: str = "data/models/yolov8n_gaming.onnx",
+        player_detector_model_path: str = "data/models/yolov8n.onnx",
         detection_confidence_threshold: float = 0.45,
         detection_nms_threshold: float = 0.45,
         detection_player_class_ids: list[int] | None = None,

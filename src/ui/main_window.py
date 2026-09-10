@@ -113,7 +113,7 @@ class MainWindow(QMainWindow):
             analysis_stride=int(settings.get("analysis_stride", 3)),
             dataset_exporter=self.dataset_exporter,
             target_resolution=target_resolution,
-            player_detector_model_path=str(settings.get("player_detector_model_path", "data/models/yolov8n_gaming.onnx")),
+            player_detector_model_path=str(settings.get("player_detector_model_path", "data/models/yolov8n.onnx")),
             detection_confidence_threshold=float(settings.get("detection_confidence_threshold", 0.45)),
             detection_nms_threshold=float(settings.get("detection_nms_threshold", 0.45)),
             detection_player_class_ids=settings.get("detection_player_class_ids", []),
