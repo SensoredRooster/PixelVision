@@ -17,5 +17,7 @@
   "detection_nms_threshold": 0.45,
   "detection_player_class_ids": [0],
   "detection_corroboration_margin_px": 12,
-  "facecam_roi": []
+  "facecam_roi": [],
+  "source_profile": "hdmi_game",
+  "stream_chat_ignore": true
 }

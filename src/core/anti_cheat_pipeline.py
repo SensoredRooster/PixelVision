@@ -50,12 +50,55 @@ class PixelVisionLogger:
             handle.write(json.dumps(asdict(event)) + "\n")
 
 
+SOURCE_PROFILES = ("hdmi_game", "stream_window", "vod_file")
+SOURCE_PROFILE_LABELS = {
+    "hdmi_game": "HDMI GAME",
+    "stream_window": "STREAM WINDOW",
+    "vod_file": "VOD FILE",
+}
+
 _FACECAM_ROI_FRACTIONS = (0.62, 0.42, 0.99, 0.82)
+_STREAM_TOP_FRAC = (0.0, 0.0, 1.0, 0.10)
+_STREAM_BOTTOM_FRAC = (0.0, 0.88, 1.0, 1.0)
+_STREAM_CHAT_FRAC = (0.80, 0.10, 1.0, 0.88)
+_BLACK_FRAME_MEAN = 8.0
 
 
-def _default_facecam_roi(width: int, height: int) -> tuple[int, int, int, int]:
-    x0_frac, y0_frac, x1_frac, y1_frac = _FACECAM_ROI_FRACTIONS
-    return (int(width * x0_frac), int(height * y0_frac), int(width * x1_frac), int(height * y1_frac))
+def _clamp_frac(rect: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    x0, y0, x1, y1 = rect
+    x0 = min(max(float(x0), 0.0), 1.0)
+    y0 = min(max(float(y0), 0.0), 1.0)
+    x1 = min(max(float(x1), 0.0), 1.0)
+    y1 = min(max(float(y1), 0.0), 1.0)
+    return (x0, y0, x1, y1)
+
+
+def _frac_to_pixels(width: int, height: int, rect: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = rect
+    return (int(width * x0), int(height * y0), int(width * x1), int(height * y1))
+
+
+def _normalize_facecam_frac(
+    facecam_roi: tuple[int, int, int, int] | list[int] | None,
+    width: int,
+    height: int,
+) -> tuple[float, float, float, float]:
+    if not facecam_roi:
+        return _FACECAM_ROI_FRACTIONS
+    x0, y0, x1, y1 = (float(v) for v in facecam_roi[:4])
+    if max(x0, y0, x1, y1) <= 1.0:
+        return _clamp_frac((x0, y0, x1, y1))
+    width = max(width, 1)
+    height = max(height, 1)
+    return _clamp_frac((x0 / width, y0 / height, x1 / width, y1 / height))
+
+
+def _is_black_frame(frame: np.ndarray) -> bool:
+    if frame.size == 0:
+        return True
+    small = cv2.resize(frame, (32, 18), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY) if small.ndim == 3 else small
+    return float(gray.mean()) < _BLACK_FRAME_MEAN
 
 
 class AntiCheatPipeline:
@@ -72,6 +115,8 @@ class AntiCheatPipeline:
         detection_player_class_ids: list[int] | None = None,
         detection_corroboration_margin_px: int = 12,
         facecam_roi: tuple[int, int, int, int] | list[int] | None = None,
+        source_profile: str = "hdmi_game",
+        stream_chat_ignore: bool = True,
     ):
         self.logger = PixelVisionLogger(log_dir=log_dir)
         self.model_path = model_path
@@ -98,8 +143,16 @@ class AntiCheatPipeline:
         self.detector_has_result = False
         self.detection_corroboration_margin_px = detection_corroboration_margin_px
         self._facecam_roi_explicit = facecam_roi is not None
-        self.facecam_roi = tuple(facecam_roi) if facecam_roi else _default_facecam_roi(*target_resolution)
+        self._target_resolution = target_resolution
+        self._facecam_frac = _normalize_facecam_frac(facecam_roi, *target_resolution)
+        self.facecam_roi = _frac_to_pixels(*target_resolution, self._facecam_frac)
+        self._stream_chat_ignore = bool(stream_chat_ignore)
+        self._stream_frozen = False
+        self._ignore_fracs: list[tuple[float, float, float, float]] = []
+        self._ignore_rects_px: list[tuple[int, int, int, int]] = []
+        self._content_frac = (0.0, 0.0, 1.0, 1.0)
         self._max_box_area_ratio = 0.35
+        self.set_source_profile(source_profile)
         self._initialize_onnx_runtime()
 
     @property
@@ -138,12 +191,87 @@ class AntiCheatPipeline:
     def should_analyze_frame(self, frame_id: int) -> bool:
         return frame_id % self.analysis_stride == 0
 
-    def _is_excluded_region(self, x1: int, y1: int, x2: int, y2: int, cx: int, cy: int) -> bool:
-        if self.facecam_roi is not None:
-            rx1, ry1, rx2, ry2 = self.facecam_roi
-            if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
-                return True
+    def _is_excluded_region(
+        self, x1: int, y1: int, x2: int, y2: int, cx: int, cy: int, width: int, height: int
+    ) -> bool:
+        if width > 0 and height > 0:
+            nx = cx / width
+            ny = cy / height
+            for x0, y0, x1f, y1f in self._ignore_fracs:
+                if x0 <= nx <= x1f and y0 <= ny <= y1f:
+                    return True
         return self.hud_masker.overlaps_masked_region(x1, y1, x2, y2)
+
+    @property
+    def source_profile(self) -> str:
+        return self._source_profile
+
+    @property
+    def ignore_rect_count(self) -> int:
+        return len(self._ignore_fracs)
+
+    def set_stream_frozen(self, frozen: bool) -> None:
+        self._stream_frozen = bool(frozen)
+
+    def set_source_profile(self, profile: str) -> None:
+        if profile not in SOURCE_PROFILES:
+            profile = "hdmi_game"
+        self._source_profile = profile
+        if profile == "hdmi_game":
+            self._content_frac = (0.0, 0.0, 1.0, 1.0)
+        else:
+            self._content_frac = (0.0, 0.10, 0.80, 0.88)
+        self._rebuild_ignore_rects()
+
+    def _rebuild_ignore_rects(self) -> None:
+        width, height = self._target_resolution
+        fracs: list[tuple[float, float, float, float]] = []
+        if self._source_profile in ("stream_window", "vod_file"):
+            fracs.append(_STREAM_TOP_FRAC)
+            fracs.append(_STREAM_BOTTOM_FRAC)
+            if self._stream_chat_ignore:
+                fracs.append(_STREAM_CHAT_FRAC)
+        fracs.append(self._facecam_frac)
+        self._ignore_fracs = fracs
+        self._ignore_rects_px = [_frac_to_pixels(width, height, rect) for rect in fracs]
+        self.facecam_roi = _frac_to_pixels(width, height, self._facecam_frac)
+
+    def _pixel_ignore_rects(self, width: int, height: int) -> list[tuple[int, int, int, int]]:
+        return [_frac_to_pixels(width, height, rect) for rect in self._ignore_fracs]
+
+    def _zero_ignore_pixels(self, frame: np.ndarray) -> np.ndarray:
+        height, width = frame.shape[:2]
+        for x1, y1, x2, y2 in self._pixel_ignore_rects(width, height):
+            x1c = max(0, min(width, x1))
+            x2c = max(0, min(width, x2))
+            y1c = max(0, min(height, y1))
+            y2c = max(0, min(height, y2))
+            if x2c > x1c and y2c > y1c:
+                frame[y1c:y2c, x1c:x2c] = 0
+        return frame
+
+    def _scene_skip_reason(self, frame: np.ndarray) -> str | None:
+        if self._stream_frozen:
+            return "frozen"
+        if _is_black_frame(frame):
+            return "black"
+        if self.hud_masker.cinematic_letterbox(frame, self._content_frac):
+            return "letterbox"
+        if not self.hud_masker.hud_energy_present(frame, self._content_frac):
+            return "no_hud"
+        return None
+
+    def _idle_telemetry(self, scene_skip: str | None = None) -> dict[str, Any]:
+        snapshot = {
+            "flagged": False,
+            "straightness": 0.0,
+            "tremor_variance": 0.0,
+            "source_profile": self._source_profile,
+            "ignore_rect_count": self.ignore_rect_count,
+        }
+        if scene_skip:
+            snapshot["scene_skip"] = scene_skip
+        return snapshot
 
     def _exceeds_max_area(self, x1: int, y1: int, x2: int, y2: int, display_w: int, display_h: int) -> bool:
         frame_area = max(1, display_w * display_h)
@@ -180,7 +308,9 @@ class AntiCheatPipeline:
             cx_rescaled = int(cx * scale_x)
             cy_rescaled = int(cy * scale_y)
 
-            if self._is_excluded_region(x1_rescaled, y1_rescaled, x2_rescaled, y2_rescaled, cx_rescaled, cy_rescaled):
+            if self._is_excluded_region(
+                x1_rescaled, y1_rescaled, x2_rescaled, y2_rescaled, cx_rescaled, cy_rescaled, display_w, display_h
+            ):
                 continue
             if self._exceeds_max_area(x1_rescaled, y1_rescaled, x2_rescaled, y2_rescaled, display_w, display_h):
                 continue
@@ -204,19 +334,32 @@ class AntiCheatPipeline:
             return list(self.last_tracked_entities)
 
     def update_target_resolution(self, width: int, height: int) -> None:
+        self._target_resolution = (width, height)
         self.hud_masker.set_target_resolution(width, height)
         if not self._facecam_roi_explicit:
-            self.facecam_roi = _default_facecam_roi(width, height)
+            self._facecam_frac = _FACECAM_ROI_FRACTIONS
+        self._rebuild_ignore_rects()
 
     def process_frame(self, frame_context: FrameContext) -> Optional[CheatEvent]:
         self.frame_counter += 1
         source_frame = frame_context.analysis_frame if frame_context.analysis_frame is not None else frame_context.frame
+        skip_reason = self._scene_skip_reason(source_frame)
+        if skip_reason:
+            self.crosshair_analyzer.reset()
+            self.last_telemetry_snapshot = self._idle_telemetry(skip_reason)
+            self.last_event_type = None
+            self.last_mechanical_lock_detected = False
+            return None
+
         masked_frame = self.hud_masker.apply_mask(source_frame)
+        masked_frame = self._zero_ignore_pixels(masked_frame)
         if self._check_duplicate(masked_frame):
             return None
 
         metrics = self.crosshair_analyzer.update(masked_frame, frame_context.timestamp)
-        self.last_telemetry_snapshot = self.crosshair_analyzer.last_metrics
+        self.last_telemetry_snapshot = dict(self.crosshair_analyzer.last_metrics or self._idle_telemetry())
+        self.last_telemetry_snapshot["source_profile"] = self._source_profile
+        self.last_telemetry_snapshot["ignore_rect_count"] = self.ignore_rect_count
         if not metrics or not metrics.get("flagged"):
             self.last_event_type = None
             self.last_mechanical_lock_detected = False
@@ -277,6 +420,8 @@ class AntiCheatPipeline:
                 "path": metrics.get("path", []),
                 "residuals": metrics.get("residuals", []),
                 "associated_track_id": associated_track_id,
+                "source_profile": self._source_profile,
+                "ignore_rect_count": self.ignore_rect_count,
             },
         )
         self.logger.commit(event)
@@ -287,6 +432,7 @@ class AntiCheatPipeline:
         self.last_telemetry_snapshot = None
         self.last_event_type = None
         self.last_mechanical_lock_detected = False
+        self._stream_frozen = False
         with self._entities_lock:
             self.last_tracked_entities = []
             self.detector_has_result = False

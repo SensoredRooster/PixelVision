@@ -133,9 +133,9 @@ class FFmpegRawVideoCapture:
             "-flags",
             "low_delay",
             "-thread_queue_size",
-            "1024",
+            "8",
             "-rtbufsize",
-            "256M",
+            "8M",
             "-f",
             "dshow",
             "-framerate",
@@ -257,16 +257,21 @@ class FFmpegRawVideoCapture:
         return False
 
     def release(self) -> None:
-        if self._process is None:
-            return
         self._reader_stop_event.set()
-        if self._process.poll() is None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
+        process = self._process
         self._process = None
+        if process is not None:
+            if process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except Exception:
+                    pass
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
         if self._reader_thread is not None and self._reader_thread.is_alive():
             self._reader_thread.join(timeout=1.0)
         self._reader_thread = None
@@ -624,36 +629,31 @@ class FrameSource:
         except AttributeError:
             pass
 
-        self.capture_width = float(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0.0)
-        self.capture_height = float(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0.0)
-        self.capture_fps = float(self.capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        prop_width = float(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0.0)
+        prop_height = float(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0.0)
+        prop_fps = float(self.capture.get(cv2.CAP_PROP_FPS) or 0.0)
 
-        if self.capture_fps <= 0.0:
-            probe_times: list[float] = []
-            for _ in range(8):
-                ok, frame = self.capture.read()
-                if not ok or frame is None:
-                    break
-                probe_times.append(time.perf_counter())
-            if len(probe_times) >= 2:
-                deltas = [probe_times[i] - probe_times[i - 1] for i in range(1, len(probe_times))]
-                average_delta = sum(deltas) / max(len(deltas), 1)
-                if average_delta > 0:
-                    self.capture_fps = 1.0 / average_delta
-
-        if self.capture_width <= 0.0 or self.capture_height <= 0.0:
-            # Capture cards often lie about mode negotiation until a real frame is read.
-            # Trust the first actual frame instead of keeping stale 1080p props.
+        frame_width = 0.0
+        frame_height = 0.0
+        probe_times: list[float] = []
+        for _ in range(8):
             ok, frame = self.capture.read()
-            if ok and frame is not None:
-                self.capture_width = float(frame.shape[1])
-                self.capture_height = float(frame.shape[0])
-                if self.capture_fps <= 0.0:
-                    self.capture_fps = max(1.0, float(settings.get("capture_fps", 144) or 144))
+            if not ok or frame is None:
+                break
+            frame_height = float(frame.shape[0])
+            frame_width = float(frame.shape[1])
+            probe_times.append(time.perf_counter())
 
-        self.capture_width = float(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH) or self.capture_width or 0.0)
-        self.capture_height = float(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or self.capture_height or 0.0)
-        self.capture_fps = float(self.capture.get(cv2.CAP_PROP_FPS) or self.capture_fps or 0.0)
+        self.capture_width = frame_width or prop_width
+        self.capture_height = frame_height or prop_height
+        self.capture_fps = prop_fps
+        if self.capture_fps <= 0.0 and len(probe_times) >= 2:
+            deltas = [probe_times[i] - probe_times[i - 1] for i in range(1, len(probe_times))]
+            average_delta = sum(deltas) / max(len(deltas), 1)
+            if average_delta > 0:
+                self.capture_fps = 1.0 / average_delta
+        if self.capture_fps <= 0.0:
+            self.capture_fps = max(1.0, float(settings.get("capture_fps", 144) or 144))
 
         if self.capture_width > 0 and self.capture_height > 0:
             self.settings["capture_width"] = int(self.capture_width)
@@ -692,9 +692,15 @@ class FrameSource:
             return False, None
 
     def close(self) -> None:
-        if self.capture is not None:
-            self.capture.release()
-            self.capture = None
+        capture = self.capture
+        self.capture = None
+        if capture is not None:
+            try:
+                capture.release()
+            except cv2.error:
+                pass
+            except Exception:
+                pass
         self.screen = None
 
 

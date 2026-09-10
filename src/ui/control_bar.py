@@ -51,6 +51,7 @@ class ControlBar(QWidget):
     recordBaselineToggled = Signal()
     rescanDevicesRequested = Signal()
     analyzeDisplayToggled = Signal(bool)
+    sourceProfileChanged = Signal(str)
     # (width, height, fps) -- (0, 0, 0) means "let auto-calibration decide".
     captureModeChanged = Signal(int, int, int)
 
@@ -73,6 +74,9 @@ class ControlBar(QWidget):
         self.rescan_btn = QPushButton("🔄 RESCAN")
         self.rescan_btn.clicked.connect(self.rescanDevicesRequested.emit)
         layout.addWidget(self.rescan_btn)
+
+        self.profile_group = self._build_profile_group()
+        layout.addWidget(self.profile_group)
 
         # Center cluster: view-mode chips.
         layout.addStretch(1)
@@ -120,6 +124,40 @@ class ControlBar(QWidget):
             group_layout.addWidget(button)
         self.view_buttons["standard"].setChecked(True)
         return group
+
+    def _build_profile_group(self) -> QFrame:
+        group = QFrame(self)
+        group.setObjectName("ControlGroup")
+        group_layout = QHBoxLayout(group)
+        group_layout.setContentsMargins(4, 4, 4, 4)
+        group_layout.setSpacing(6)
+
+        label = QLabel("SRC")
+        label.setObjectName("ControlGroupLabel")
+        group_layout.addWidget(label)
+
+        self.profile_combo = QComboBox()
+        self.profile_combo.setToolTip(
+            "Source profile: ignore stream chrome / facecam and scene-gate kinematics."
+        )
+        for text, profile in (("HDMI", "hdmi_game"), ("STREAM", "stream_window"), ("VOD", "vod_file")):
+            self.profile_combo.addItem(text, profile)
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
+        group_layout.addWidget(self.profile_combo)
+        return group
+
+    def _on_profile_changed(self, index: int) -> None:
+        profile = self.profile_combo.itemData(index)
+        if profile:
+            self.sourceProfileChanged.emit(str(profile))
+
+    def set_source_profile(self, profile: str) -> None:
+        index = self.profile_combo.findData(profile)
+        if index < 0 or index == self.profile_combo.currentIndex():
+            return
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.setCurrentIndex(index)
+        self.profile_combo.blockSignals(False)
 
     def _build_capture_mode_group(self) -> QFrame:
         group = QFrame(self)

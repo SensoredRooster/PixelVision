@@ -39,53 +39,78 @@ class PixelVisionDatasetExporter:
         self._writer_thread.start()
         return str(output_path)
 
-    def stop_clean_baseline_mode(self) -> None:
-        if not self.is_recording_baseline:
-            return
+    def set_target_resolution(self, width: int, height: int) -> None:
+        self.width = max(1, int(width))
+        self.height = max(1, int(height))
 
+    def stop_clean_baseline_mode(self) -> None:
         self.is_recording_baseline = False
         self._writer_stop_event.set()
         if self._writer_thread is not None and self._writer_thread.is_alive():
-            self._writer_thread.join(timeout=1.0)
+            self._writer_thread.join(timeout=2.0)
         self._writer_thread = None
-        if self.video_writer is not None:
-            self.video_writer.release()
-            self.video_writer = None
+        self._release_writer()
+        self._drain_write_queue()
+
+    def write_frame(self, frame: np.ndarray) -> None:
+        if not self.is_recording_baseline or self.video_writer is None:
+            return
+        if self._write_queue.full():
+            return
+        try:
+            self._write_queue.put_nowait(frame.copy())
+        except queue.Full:
+            return
+
+    def _drain_write_queue(self) -> None:
         while True:
             try:
                 self._write_queue.get_nowait()
             except queue.Empty:
                 break
 
-    def write_frame(self, frame: np.ndarray) -> None:
-        if not self.is_recording_baseline or self.video_writer is None:
+    def _release_writer(self) -> None:
+        writer = self.video_writer
+        self.video_writer = None
+        if writer is None:
             return
-
         try:
-            self._write_queue.put_nowait(frame.copy())
-        except queue.Full:
-            try:
-                self._write_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._write_queue.put_nowait(frame.copy())
-            except queue.Full:
-                pass
+            writer.release()
+        except cv2.error:
+            pass
+        except Exception:
+            pass
+
+    def _abort_writer(self) -> None:
+        self.is_recording_baseline = False
+        self._writer_stop_event.set()
+        self._release_writer()
+        self._drain_write_queue()
 
     def _baseline_writer_loop(self) -> None:
-        while not self._writer_stop_event.is_set() or not self._write_queue.empty():
-            try:
-                frame = self._write_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
+        try:
+            while not self._writer_stop_event.is_set() or not self._write_queue.empty():
+                try:
+                    frame = self._write_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
 
-            if self.video_writer is None:
-                continue
+                writer = self.video_writer
+                if writer is None:
+                    continue
 
-            if frame.shape[:2] != (self.height, self.width):
-                frame = cv2.resize(frame, (self.width, self.height))
-            self.video_writer.write(frame)
+                try:
+                    if frame.shape[:2] != (self.height, self.width):
+                        frame = cv2.resize(frame, (self.width, self.height))
+                    writer.write(frame)
+                except cv2.error:
+                    self._abort_writer()
+                    return
+                except Exception:
+                    self._abort_writer()
+                    return
+        except Exception:
+            self._abort_writer()
 
     def export_suspicious_incident_clip(self, historical_frames_buffer: list[np.ndarray], incident_id: int) -> str:
         if not historical_frames_buffer:

@@ -40,6 +40,7 @@ class CaptureWorker(QObject):
     sourceOpened = Signal(int, int, float, str)
     captureError = Signal(str)
     streamFrozen = Signal(bool)
+    waitingForDevice = Signal()
 
     def __init__(self, settings: dict, dataset_exporter: PixelVisionDatasetExporter):
         super().__init__()
@@ -50,13 +51,20 @@ class CaptureWorker(QObject):
         self._lock = threading.Lock()
         self._latest_context: FrameContext | None = None
         self._frame_sequence = 0
-        self._recent_frame_cache: deque[np.ndarray] = deque(maxlen=60)
+        self._recent_frame_cache: deque[np.ndarray] = deque(maxlen=1)
         self._live_frame_timestamps: deque[float] = deque(maxlen=180)
         self._ffmpeg_capture: FFmpegRawVideoCapture | None = None
+        self._frame_signal_pending = False
+        self._negotiated = (0, 0, 0.0)
+        self._backend = ""
 
     def get_latest_context(self) -> FrameContext | None:
         with self._lock:
             return self._latest_context
+
+    def ack_frame_signal(self) -> None:
+        with self._lock:
+            self._frame_signal_pending = False
 
     def get_recent_frame_cache(self) -> list[np.ndarray]:
         with self._lock:
@@ -89,10 +97,10 @@ class CaptureWorker(QObject):
 
         capture = getattr(self._frame_source, "capture", None)
         self._ffmpeg_capture = capture if isinstance(capture, FFmpegRawVideoCapture) else None
-        width = int(getattr(self._frame_source, "capture_width", 0) or 0)
-        height = int(getattr(self._frame_source, "capture_height", 0) or 0)
-        fps = float(getattr(self._frame_source, "capture_fps", 0.0) or 0.0)
+        width, height, fps = self._read_negotiated_properties(capture)
         backend = "CAP_FFMPEG" if isinstance(capture, FFmpegRawVideoCapture) else "CAP_DSHOW"
+        self._backend = backend
+        self._negotiated = (width, height, fps)
         self.sourceOpened.emit(width, height, fps, backend)
 
         try:
@@ -100,9 +108,66 @@ class CaptureWorker(QObject):
         except Exception as exc:
             self.captureError.emit(f"capture worker crashed: {exc!r}")
         finally:
-            if self._frame_source is not None:
-                self._frame_source.close()
-                self._frame_source = None
+            self._close_frame_source()
+
+    def _close_frame_source(self) -> None:
+        source = self._frame_source
+        self._frame_source = None
+        self._ffmpeg_capture = None
+        if source is None:
+            return
+        try:
+            source.close()
+        except Exception:
+            pass
+
+    def _read_negotiated_properties(self, capture: object | None) -> tuple[int, int, float]:
+        width = height = 0
+        fps = 0.0
+        if capture is not None:
+            try:
+                width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            except Exception:
+                pass
+        source = self._frame_source
+        if source is not None:
+            if width <= 0:
+                width = int(getattr(source, "capture_width", 0) or 0)
+            if height <= 0:
+                height = int(getattr(source, "capture_height", 0) or 0)
+            if fps <= 0.0:
+                fps = float(getattr(source, "capture_fps", 0.0) or 0.0)
+        return width, height, fps
+
+    def _publish_latest(self, context: FrameContext) -> None:
+        with self._lock:
+            self._latest_context = context
+            self._recent_frame_cache.append(context.frame)
+            emit_now = not self._frame_signal_pending
+            if emit_now:
+                self._frame_signal_pending = True
+        if emit_now:
+            self.frameAvailable.emit(context.frame_id)
+
+    def _clear_latest_frame(self) -> None:
+        with self._lock:
+            self._latest_context = None
+            self._recent_frame_cache.clear()
+
+    def _maybe_emit_negotiated_from_frame(self, frame: np.ndarray) -> None:
+        height, width = frame.shape[:2]
+        prev_w, prev_h, fps = self._negotiated
+        if width <= 0 or height <= 0 or (width == prev_w and height == prev_h):
+            return
+        if self._frame_source is not None:
+            self._frame_source.capture_width = float(width)
+            self._frame_source.capture_height = float(height)
+            self._frame_source.settings["capture_width"] = width
+            self._frame_source.settings["capture_height"] = height
+        self._negotiated = (width, height, fps)
+        self.sourceOpened.emit(width, height, fps, self._backend)
 
     def _describe_capture_stall(self) -> str:
         capture = getattr(self._frame_source, "capture", None)
@@ -118,26 +183,36 @@ class CaptureWorker(QObject):
     def _read_loop(self) -> None:
         stall_started_at: float | None = None
         stall_timeout_seconds = 3.0
+        empty_clear_seconds = 1.0
+        waiting_reported = False
         is_frozen_reported = False
 
         while not self._stop_event.is_set():
             try:
-                success, frame = self._frame_source.read()
+                success, frame = self._frame_source.read() if self._frame_source is not None else (False, None)
             except Exception:
                 success, frame = False, None
 
             if not success or frame is None:
+                device_gone = self._ffmpeg_capture is not None and not self._ffmpeg_capture.isOpened()
                 if stall_started_at is None:
                     stall_started_at = time.time()
-                elif time.time() - stall_started_at > stall_timeout_seconds:
+                elapsed = time.time() - stall_started_at
+                if elapsed >= empty_clear_seconds and not waiting_reported:
+                    self._clear_latest_frame()
+                    self.waitingForDevice.emit()
+                    waiting_reported = True
+                if elapsed > stall_timeout_seconds and (device_gone or self._ffmpeg_capture is None):
                     self.captureError.emit(self._describe_capture_stall())
                     return
                 time.sleep(0.001)
                 continue
 
             stall_started_at = None
+            waiting_reported = False
 
             try:
+                self._maybe_emit_negotiated_from_frame(frame)
                 if self._ffmpeg_capture is not None:
                     is_frozen_now = self._ffmpeg_capture.is_stream_frozen()
                     if is_frozen_now != is_frozen_reported:
@@ -153,19 +228,16 @@ class CaptureWorker(QObject):
                     source=str(self._settings.get("capture_mode", "camera")),
                     is_duplicate=False,
                 )
-                with self._lock:
-                    self._latest_context = context
-                    self._recent_frame_cache.append(_downscale(frame, 960, 540))
                 self._live_frame_timestamps.append(timestamp)
+                self._publish_latest(context)
                 self._dataset_exporter.write_frame(frame)
-
-                self.frameAvailable.emit(context.frame_id)
             except Exception as exc:
                 self.captureError.emit(f"capture pipeline error: {exc!r}")
                 return
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._close_frame_source()
 
 
 class PlaybackWorker(QObject):
@@ -288,6 +360,13 @@ class PlaybackWorker(QObject):
 
     def stop(self) -> None:
         self._stop_event.set()
+        capture = self._capture
+        self._capture = None
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                pass
 
 
 class AnalysisWorker(QObject):
@@ -315,19 +394,19 @@ class AnalysisWorker(QObject):
     @Slot(int)
     def on_frame_available(self, frame_id: int) -> None:
         with self._source_lock:
-            if frame_id == self._last_analyzed_frame_id:
-                return
             source = self._source
             capture_worker = self._capture_worker
 
+        if isinstance(source, CaptureWorker):
+            source.ack_frame_signal()
         ctx = source.get_latest_context()
-        if ctx is None or ctx.frame_id != frame_id:
+        if ctx is None or ctx.frame_id == self._last_analyzed_frame_id:
             return
 
         if not self._pipeline.should_analyze_frame(ctx.frame_id):
             return
         with self._source_lock:
-            self._last_analyzed_frame_id = frame_id
+            self._last_analyzed_frame_id = ctx.frame_id
 
         if ctx.analysis_frame is None:
             ctx.analysis_frame = _downscale(ctx.frame, 960, 540)

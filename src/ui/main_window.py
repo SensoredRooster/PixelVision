@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.core.anti_cheat_pipeline import AntiCheatPipeline, CheatEvent
+from src.core.anti_cheat_pipeline import SOURCE_PROFILE_LABELS, AntiCheatPipeline, CheatEvent
 from src.core.dataset_exporter import PixelVisionDatasetExporter
 from src.core.event_logger import EventLogger
 from src.core.frame_source import discover_directshow_devices, pick_preferred_capture_device
@@ -119,6 +119,8 @@ class MainWindow(QMainWindow):
             detection_player_class_ids=settings.get("detection_player_class_ids", []),
             detection_corroboration_margin_px=int(settings.get("detection_corroboration_margin_px", 12)),
             facecam_roi=facecam_roi,
+            source_profile=str(settings.get("source_profile", "hdmi_game")),
+            stream_chat_ignore=bool(settings.get("stream_chat_ignore", True)),
         )
         self.live_overlay = PixelVisionLiveOverlay()
         self.advanced_overlay = PixelVisionAdvancedOverlayEngine(target_resolution=target_resolution)
@@ -166,6 +168,7 @@ class MainWindow(QMainWindow):
         self.control_bar.rescanDevicesRequested.connect(self._on_rescan_devices_requested)
         self.control_bar.captureModeChanged.connect(self._on_capture_mode_changed)
         self.control_bar.analyzeDisplayToggled.connect(self._on_analyze_display_toggled)
+        self.control_bar.sourceProfileChanged.connect(self._on_source_profile_changed)
         layout.addWidget(self.control_bar, 0)
 
         self.body_splitter = QSplitter(Qt.Horizontal, self)
@@ -236,6 +239,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status_bar)
 
         self.control_bar.set_stream_mode(self._stream_mode)
+        self.control_bar.set_source_profile(str(self.settings.get("source_profile", "hdmi_game")))
         self._update_signal_card()
 
     # ------------------------------------------------------------------
@@ -282,6 +286,7 @@ class MainWindow(QMainWindow):
         self._capture_worker.sourceOpened.connect(self._on_capture_source_opened)
         self._capture_worker.captureError.connect(self._on_capture_error)
         self._capture_worker.streamFrozen.connect(self._on_capture_stream_frozen)
+        self._capture_worker.waitingForDevice.connect(self._on_waiting_for_capture)
         self._capture_worker.frameAvailable.connect(self._on_live_frame_available)
         self._capture_worker.frameAvailable.connect(self._analysis_worker.on_frame_available)
         self._capture_thread.started.connect(self._capture_worker.start)
@@ -296,14 +301,25 @@ class MainWindow(QMainWindow):
             self.video_canvas.set_idle_text("No capture device detected — Mount a gameplay recording to begin")
             self.status_label.setText("No capture device detected")
 
+    def _stop_baseline_safe(self) -> None:
+        try:
+            self.dataset_exporter.stop_clean_baseline_mode()
+        except Exception:
+            pass
+        self.control_bar.set_recording_baseline(False, self._stream_mode)
+        self.control_bar.mount_vod_btn.setEnabled(True)
+
     def _teardown_capture(self) -> None:
+        self._stop_baseline_safe()
         if self._capture_worker is not None:
             self._capture_worker.stop()
         if self._capture_thread is not None:
             self._capture_thread.quit()
-            self._capture_thread.wait(2000)
+            self._capture_thread.wait(5000)
         self._capture_worker = None
         self._capture_thread = None
+        self.video_canvas.clear_frame()
+        self._last_rendered_frame_id = -1
 
     def _teardown_playback(self) -> None:
         if self._playback_worker is not None:
@@ -343,7 +359,10 @@ class MainWindow(QMainWindow):
         self._last_rendered_frame_id = -1
         self._stream_mode = "vod"
         self._is_stream_frozen = False
+        self.pipeline.set_stream_frozen(False)
         self.control_bar.set_stream_mode(self._stream_mode)
+        if str(self.settings.get("source_profile", "hdmi_game")) == "hdmi_game":
+            self._apply_source_profile("stream_window")
         self._update_signal_card()
 
         self._mounted_vod_name = Path(path).name
@@ -384,6 +403,7 @@ class MainWindow(QMainWindow):
         self._detection_worker.set_source(self._capture_worker)
         self._stream_mode = "live"
         self._is_stream_frozen = False
+        self.pipeline.set_stream_frozen(False)
         self.control_bar.set_stream_mode(self._stream_mode)
         self._update_signal_card()
         self._flagged_track_ids = OrderedDict()
@@ -435,6 +455,18 @@ class MainWindow(QMainWindow):
         self._analyze_display_anyway = checked
         self._update_detection_enabled()
 
+    def _apply_source_profile(self, profile: str) -> None:
+        self.settings["source_profile"] = profile
+        self.pipeline.set_source_profile(profile)
+        self.control_bar.set_source_profile(profile)
+        self.status_label.setText(self._status_text_with_mode())
+
+    def _on_source_profile_changed(self, profile: str) -> None:
+        previous = str(self.settings.get("source_profile", "hdmi_game"))
+        self._apply_source_profile(profile)
+        if self._stream_mode == "live" and previous != profile:
+            self._restart_capture(self._current_device)
+
     def _update_detection_enabled(self) -> None:
         if self._detection_worker is None:
             return
@@ -448,9 +480,15 @@ class MainWindow(QMainWindow):
     def _on_capture_source_opened(self, width: int, height: int, fps: float, backend: str) -> None:
         self._stream_mode = "live"
         self._is_stream_frozen = False
+        self.pipeline.set_stream_frozen(False)
         self.control_bar.set_stream_mode(self._stream_mode)
         self._update_signal_card()
+        self.settings["capture_width"] = int(width)
+        self.settings["capture_height"] = int(height)
+        if fps > 0:
+            self.settings["capture_fps"] = int(round(fps))
         self.pipeline.update_target_resolution(width, height)
+        self.dataset_exporter.set_target_resolution(width, height)
         override = self.settings.get("capture_resolution_override")
         override_rejected = override is not None and (
             int(override.get("width", 0)) != width
@@ -471,12 +509,15 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_capture_error(self, message: str) -> None:
+        self.video_canvas.clear_frame()
         self.status_label.setText(f"CAPTURE ERROR: {message}")
         self.video_canvas.set_idle_text(f"Capture error: {message}")
+        self._last_rendered_frame_id = -1
 
     @Slot(bool)
     def _on_capture_stream_frozen(self, is_frozen: bool) -> None:
         self._is_stream_frozen = is_frozen
+        self.pipeline.set_stream_frozen(is_frozen)
         if is_frozen:
             self.status_label.setText(
                 f"{self._current_base_status_text()} · ⚠ NO PIXEL CHANGE DETECTED (signal or source may be frozen)"
@@ -487,8 +528,17 @@ class MainWindow(QMainWindow):
             self.status_label.setText(self._status_text_with_mode())
         self._update_signal_card()
 
+    @Slot()
+    def _on_waiting_for_capture(self) -> None:
+        self.video_canvas.clear_frame()
+        self.video_canvas.set_idle_text("Waiting for capture device")
+        self.status_label.setText("Waiting for capture device")
+        self._last_rendered_frame_id = -1
+
     @Slot(int)
     def _on_live_frame_available(self, frame_id: int) -> None:
+        if self._capture_worker is not None:
+            self._capture_worker.ack_frame_signal()
         self._render_frame(self._capture_worker, frame_id)
 
     @Slot(int, int, float, int)
@@ -567,25 +617,31 @@ class MainWindow(QMainWindow):
             "flagged_only": "FLAGGED",
         }.get(self._view_mode, self._view_mode.upper())
 
+    def _profile_status_name(self) -> str:
+        profile = str(self.settings.get("source_profile", "hdmi_game"))
+        return SOURCE_PROFILE_LABELS.get(profile, profile.upper())
+
     def _status_text_with_mode(self) -> str:
-        return f"{self._current_base_status_text()} · {self._status_mode_suffix()}"
+        return f"{self._current_base_status_text()} · {self._profile_status_name()} · {self._status_mode_suffix()}"
 
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
     def _render_frame(self, source: CaptureWorker | PlaybackWorker | None, frame_id: int) -> None:
-        if source is None or frame_id == self._last_rendered_frame_id:
+        if source is None:
             return
 
         now = time.monotonic()
         if now - self._last_paint_time < (1.0 / 30.0):
             return
-        self._last_paint_time = now
 
         ctx = source.get_latest_context()
-        if ctx is None or ctx.frame_id != frame_id:
+        if ctx is None:
             return
-        self._last_rendered_frame_id = frame_id
+        if ctx.frame_id == self._last_rendered_frame_id:
+            return
+        self._last_paint_time = now
+        self._last_rendered_frame_id = ctx.frame_id
 
         flagged_event = self._pending_flagged_event
         self._pending_flagged_event = None
@@ -642,6 +698,7 @@ class MainWindow(QMainWindow):
     # Shutdown
     # ------------------------------------------------------------------
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._stop_baseline_safe()
         self._teardown_capture()
         self._teardown_playback()
         if self._detection_worker is not None:
@@ -652,7 +709,5 @@ class MainWindow(QMainWindow):
         if self._analysis_thread is not None:
             self._analysis_thread.quit()
             self._analysis_thread.wait(2000)
-        if self.dataset_exporter.is_recording_baseline:
-            self.dataset_exporter.stop_clean_baseline_mode()
         self.event_logger.log("Application closed")
         super().closeEvent(event)
