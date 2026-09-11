@@ -5,11 +5,12 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Slot
+import cv2
+
+from PySide6.QtCore import Qt, QThread, QTimer, Slot
 from PySide6.QtGui import QCloseEvent, QColor, QImage, QPainter
 from PySide6.QtWidgets import (
     QFileDialog,
-    QFrame,
     QLabel,
     QMainWindow,
     QSplitter,
@@ -26,8 +27,8 @@ from src.core.live_overlay import PixelVisionLiveOverlay
 from src.ui.advanced_overlay import PixelVisionAdvancedOverlayEngine
 from src.ui.control_bar import ControlBar
 from src.ui.incident_queue import IncidentQueueTable
+from src.ui.left_rail import LeftRail
 from src.ui.playback_controls import PlaybackControlsBar
-from src.ui.telemetry_graph import PixelVisionTelemetryGraph
 from src.ui.theme import APP_STYLESHEET, PANEL, TEXT_MUTED, WARNING
 from src.ui.video_canvas import VideoCanvas
 from src.ui.workers import AnalysisWorker, CaptureWorker, DetectionWorker, PlaybackWorker
@@ -35,27 +36,6 @@ from src.ui.workers import AnalysisWorker, CaptureWorker, DetectionWorker, Playb
 # Cap on retained flagged-track markers so a continuous LIVE session can't grow
 # this without bound. Oldest flagged track is forgotten first (FIFO).
 _MAX_FLAGGED_TRACK_IDS = 500
-
-
-class RailCard(QFrame):
-    """Small titled info card for the left rail (SOURCE / SIGNAL)."""
-
-    def __init__(self, title: str, parent=None, *, word_wrap: bool = True):
-        super().__init__(parent)
-        self.setObjectName("RailCard")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(4)
-        title_label = QLabel(title.upper())
-        title_label.setObjectName("RailCardTitle")
-        self._body_label = QLabel("—")
-        self._body_label.setObjectName("RailCardBody")
-        self._body_label.setWordWrap(word_wrap)
-        layout.addWidget(title_label)
-        layout.addWidget(self._body_label)
-
-    def set_body(self, text: str) -> None:
-        self._body_label.setText(text)
 
 
 class VerticalLabel(QWidget):
@@ -124,7 +104,6 @@ class MainWindow(QMainWindow):
         )
         self.live_overlay = PixelVisionLiveOverlay()
         self.advanced_overlay = PixelVisionAdvancedOverlayEngine(target_resolution=target_resolution)
-        self.telemetry_graph = PixelVisionTelemetryGraph()
 
         self._view_mode = "standard"
         self._stream_mode = "live"
@@ -167,29 +146,23 @@ class MainWindow(QMainWindow):
         self.control_bar.recordBaselineToggled.connect(self._on_record_baseline_toggled)
         self.control_bar.rescanDevicesRequested.connect(self._on_rescan_devices_requested)
         self.control_bar.captureModeChanged.connect(self._on_capture_mode_changed)
-        self.control_bar.analyzeDisplayToggled.connect(self._on_analyze_display_toggled)
         self.control_bar.sourceProfileChanged.connect(self._on_source_profile_changed)
         layout.addWidget(self.control_bar, 0)
 
         self.body_splitter = QSplitter(Qt.Horizontal, self)
         self.body_splitter.setHandleWidth(1)
 
-        self.left_rail = QWidget(self)
-        self.left_rail.setObjectName("LeftRail")
-        self.left_rail.setMinimumWidth(220)
-        self.left_rail.setMaximumWidth(220)
-        rail_layout = QVBoxLayout(self.left_rail)
-        rail_layout.setContentsMargins(10, 10, 10, 10)
-        rail_layout.setSpacing(8)
-        self.source_card = RailCard("Source")
-        self.signal_card = RailCard("Signal", word_wrap=False)
-        rail_layout.addWidget(self.source_card)
-        rail_layout.addWidget(self.signal_card)
-        rail_layout.addStretch(1)
+        self.left_rail = LeftRail(self)
+        self.left_rail.analyzeToggled.connect(self._on_analyze_display_toggled)
         self.body_splitter.addWidget(self.left_rail)
 
         self.video_canvas = VideoCanvas(self)
         self.body_splitter.addWidget(self.video_canvas)
+        self._display_timer = QTimer(self)
+        self._display_timer.setTimerType(Qt.PreciseTimer)
+        self._display_timer.setInterval(16)
+        self._display_timer.timeout.connect(self._on_display_tick)
+        self._display_timer.start()
 
         self.incidents_drawer = QWidget(self)
         self.incidents_drawer.setObjectName("IncidentsDrawer")
@@ -216,7 +189,7 @@ class MainWindow(QMainWindow):
         self.body_splitter.setStretchFactor(0, 0)
         self.body_splitter.setStretchFactor(1, 1)
         self.body_splitter.setStretchFactor(2, 0)
-        self.body_splitter.setSizes([220, 1000, 28])
+        self.body_splitter.setSizes([268, 1000, 28])
 
         layout.addWidget(self.body_splitter, 1)
 
@@ -293,7 +266,12 @@ class MainWindow(QMainWindow):
 
     def _launch_capture(self, device: dict | None) -> None:
         self._last_rendered_frame_id = -1
-        if device:
+        browser = str(self.settings.get("source_profile", "hdmi_game")) == "stream_window"
+        if browser:
+            self.video_canvas.set_idle_text("Waiting for browser window...")
+            self.status_label.setText("Starting capture: browser window")
+            self._capture_thread.start()
+        elif device:
             self.video_canvas.set_idle_text("Waiting for capture device...")
             self.status_label.setText(f"Starting capture: {device.get('label', 'device')}")
             self._capture_thread.start()
@@ -386,11 +364,13 @@ class MainWindow(QMainWindow):
             self.control_bar.set_recording_baseline(False, self._stream_mode)
             self.control_bar.mount_vod_btn.setEnabled(True)
             self.status_label.setText(self._status_text_with_mode())
+            self._update_signal_card()
         else:
             output_path = self.dataset_exporter.start_clean_baseline_mode()
             self.control_bar.set_recording_baseline(True, self._stream_mode)
             self.control_bar.mount_vod_btn.setEnabled(False)
             self.status_label.setText(f"SAMPLING BASELINE · {output_path}")
+            self._update_signal_card()
 
     def _restart_capture(self, device: dict | None) -> None:
         self._teardown_playback()
@@ -454,12 +434,14 @@ class MainWindow(QMainWindow):
     def _on_analyze_display_toggled(self, checked: bool) -> None:
         self._analyze_display_anyway = checked
         self._update_detection_enabled()
+        self._update_signal_card()
 
     def _apply_source_profile(self, profile: str) -> None:
         self.settings["source_profile"] = profile
         self.pipeline.set_source_profile(profile)
         self.control_bar.set_source_profile(profile)
         self.status_label.setText(self._status_text_with_mode())
+        self._update_signal_card()
 
     def _on_source_profile_changed(self, profile: str) -> None:
         previous = str(self.settings.get("source_profile", "hdmi_game"))
@@ -501,10 +483,18 @@ class MainWindow(QMainWindow):
                 f" · ⚠ manual {override['width']}×{override['height']}@{override['fps']} not supported, auto-calibrated instead"
             )
         self.status_label.setText(self._status_text_with_mode())
-        device_label = (
-            self._current_device.get("label", self._current_device_name) if self._current_device else self._current_device_name
+        if str(self.settings.get("source_profile", "hdmi_game")) == "stream_window":
+            device_label = "Browser window"
+        else:
+            device_label = (
+                self._current_device.get("label", self._current_device_name) if self._current_device else self._current_device_name
+            )
+        self.left_rail.set_source(
+            device_label or "Capture device",
+            f"{width}×{height} @ {fps:.0f}",
+            backend,
         )
-        self.source_card.set_body(f"{device_label or 'Capture device'}\n{width}×{height} @ {fps:.0f} · {backend}")
+        self._update_signal_card()
         print(f"[CAPTURE] [SUCCESS] Source opened at {width}x{height} @ {fps:.0f}fps ({backend})")
 
     @Slot(str)
@@ -535,11 +525,17 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Waiting for capture device")
         self._last_rendered_frame_id = -1
 
+    @Slot()
+    def _on_display_tick(self) -> None:
+        if self._stream_mode == "vod":
+            self._render_frame(self._playback_worker, -1)
+        else:
+            self._render_frame(self._capture_worker, -1)
+
     @Slot(int)
     def _on_live_frame_available(self, frame_id: int) -> None:
         if self._capture_worker is not None:
             self._capture_worker.ack_frame_signal()
-        self._render_frame(self._capture_worker, frame_id)
 
     @Slot(int, int, float, int)
     def _on_playback_source_opened(self, width: int, height: int, fps: float, total_frames: int) -> None:
@@ -548,12 +544,15 @@ class MainWindow(QMainWindow):
         filename = getattr(self, "_mounted_vod_name", "VOD")
         self._vod_status_text = f"VOD · {filename} · {width}×{height} @ {fps:.0f}"
         self.status_label.setText(self._status_text_with_mode())
-        self.source_card.set_body(f"{filename}\n{width}×{height} @ {fps:.0f}")
+        self.left_rail.set_source(filename, f"{width}×{height} @ {fps:.0f}", "VOD")
+        self._update_signal_card()
 
     @Slot(int)
     def _on_playback_frame_available(self, frame_id: int) -> None:
-        self._render_frame(self._playback_worker, frame_id)
-        self.playback_controls.set_current_frame(frame_id)
+        if self._playback_worker is not None:
+            self._playback_worker.ack_frame_signal()
+        ctx = self._playback_worker.get_latest_context() if self._playback_worker is not None else None
+        self.playback_controls.set_current_frame(ctx.frame_id if ctx is not None else frame_id)
 
     @Slot()
     def _on_playback_finished(self) -> None:
@@ -598,9 +597,22 @@ class MainWindow(QMainWindow):
         telemetry = self._latest_telemetry
         straightness = float(telemetry.get("straightness") or 0.0)
         tremor = float(telemetry.get("tremor_variance") or 0.0)
-        frozen = self._is_stream_frozen
-        status_token = "FREEZE" if frozen else "ok"
-        self.signal_card.set_body(f"{status_token} · str {straightness:.2f} · tremor {tremor:.2f}")
+        self.left_rail.set_signal(frozen=self._is_stream_frozen, straightness=straightness, tremor=tremor)
+        yolo_on = (self._stream_mode == "vod") or self._analyze_display_anyway
+        tracks = 0
+        try:
+            tracks = len(self.pipeline.last_tracked_entities)
+        except Exception:
+            tracks = 0
+        gate = str(telemetry.get("scene_skip") or "live")
+        self.left_rail.set_detect(yolo_on=yolo_on, tracks=tracks, gate=gate)
+        profile = SOURCE_PROFILE_LABELS.get(
+            str(self.settings.get("source_profile", "hdmi_game")),
+            "HDMI GAME",
+        )
+        ignore_count = int(telemetry.get("ignore_rect_count") or getattr(self.pipeline, "ignore_rect_count", 0) or 0)
+        baseline = "rec" if self.dataset_exporter.is_recording_baseline else "idle"
+        self.left_rail.set_profile(profile, ignore_count, baseline)
 
     # ------------------------------------------------------------------
     # Status text helpers
@@ -632,7 +644,7 @@ class MainWindow(QMainWindow):
             return
 
         now = time.monotonic()
-        if now - self._last_paint_time < (1.0 / 30.0):
+        if now - self._last_paint_time < (1.0 / 60.0):
             return
 
         ctx = source.get_latest_context()
@@ -651,34 +663,38 @@ class MainWindow(QMainWindow):
         render_error: str | None = None
         try:
             entities = self.pipeline.get_tracked_entities()
-            display_frame = self.advanced_overlay.compile_display_frame(
-                ctx.frame,
-                entities,
-                flagged_event,
-                mode=self._view_mode,
-                flagged_track_ids=self._flagged_track_ids,
-            )
-            flagged_id = flagged_event.telemetry_data.get("associated_track_id") if flagged_event else None
-            display_frame = self.live_overlay.render_overlays(display_frame, entities, flagged_id=flagged_id)
-            telemetry = self._latest_telemetry
-            display_frame = self.telemetry_graph.draw_graph_overlay(
-                display_frame,
-                float(telemetry.get("straightness", 0.0)),
-                float(telemetry.get("tremor_variance", 0.0)),
-                is_flagged,
-            )
+            needs_overlay = is_flagged or bool(entities) or self._view_mode != "standard"
+            if needs_overlay:
+                display_frame = self.advanced_overlay.compile_display_frame(
+                    ctx.frame,
+                    entities,
+                    flagged_event,
+                    mode=self._view_mode,
+                    flagged_track_ids=self._flagged_track_ids,
+                )
+                flagged_id = flagged_event.telemetry_data.get("associated_track_id") if flagged_event else None
+                if entities:
+                    display_frame = self.live_overlay.render_overlays(display_frame, entities, flagged_id=flagged_id)
         except Exception as exc:
             display_frame = ctx.frame
             render_error = repr(exc)
 
         try:
-            ctx.preview_frame = display_frame
-            height, width = display_frame.shape[:2]
+            target_w = max(320, self.video_canvas.width())
+            target_h = max(180, self.video_canvas.height())
+            source_h, source_w = display_frame.shape[:2]
+            if source_w > target_w or source_h > target_h:
+                scale = min(target_w / source_w, target_h / source_h, 1.0)
+                display_frame = cv2.resize(
+                    display_frame,
+                    (max(1, int(source_w * scale)), max(1, int(source_h * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
             if not display_frame.flags["C_CONTIGUOUS"]:
                 display_frame = display_frame.copy()
-            qimage = QImage(display_frame.data, width, height, display_frame.strides[0], QImage.Format_BGR888)
+            height, width = display_frame.shape[:2]
+            qimage = QImage(display_frame.data, width, height, display_frame.strides[0], QImage.Format_BGR888).copy()
             self.video_canvas.set_frame(ctx, qimage)
-            self.video_canvas.update()
         except Exception as exc:
             render_error = f"canvas update failed: {exc!r}"
 
@@ -698,6 +714,7 @@ class MainWindow(QMainWindow):
     # Shutdown
     # ------------------------------------------------------------------
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._display_timer.stop()
         self._stop_baseline_safe()
         self._teardown_capture()
         self._teardown_playback()

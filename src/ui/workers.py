@@ -51,7 +51,7 @@ class CaptureWorker(QObject):
         self._lock = threading.Lock()
         self._latest_context: FrameContext | None = None
         self._frame_sequence = 0
-        self._recent_frame_cache: deque[np.ndarray] = deque(maxlen=60)
+        self._recent_frame_cache: deque[np.ndarray] = deque(maxlen=1)
         self._live_frame_timestamps: deque[float] = deque(maxlen=180)
         self._ffmpeg_capture: FFmpegRawVideoCapture | None = None
         self._frame_signal_pending = False
@@ -91,14 +91,24 @@ class CaptureWorker(QObject):
             return
 
         if not opened:
-            self.captureError.emit("Failed to open capture source")
+            if getattr(self._frame_source, "_follow_browser", False):
+                self.captureError.emit("No browser window found. Open Chrome/Edge with the stream visible.")
+            else:
+                self.captureError.emit("Failed to open capture source")
             self._frame_source = None
             return
 
         capture = getattr(self._frame_source, "capture", None)
         self._ffmpeg_capture = capture if isinstance(capture, FFmpegRawVideoCapture) else None
         width, height, fps = self._read_negotiated_properties(capture)
-        backend = "CAP_FFMPEG" if isinstance(capture, FFmpegRawVideoCapture) else "CAP_DSHOW"
+        if getattr(self._frame_source, "_follow_browser", False):
+            backend = "GDI_BROWSER"
+        elif getattr(self._frame_source, "mode", "") == "screen":
+            backend = "MSS"
+        elif isinstance(capture, FFmpegRawVideoCapture):
+            backend = "CAP_FFMPEG"
+        else:
+            backend = "CAP_DSHOW"
         self._backend = backend
         self._negotiated = (width, height, fps)
         self.sourceOpened.emit(width, height, fps, backend)
@@ -142,10 +152,9 @@ class CaptureWorker(QObject):
         return width, height, fps
 
     def _publish_latest(self, context: FrameContext) -> None:
-        preview = _downscale(context.frame, 960, 540)
         with self._lock:
             self._latest_context = context
-            self._recent_frame_cache.append(preview)
+            self._recent_frame_cache.append(context.frame)
             emit_now = not self._frame_signal_pending
             if emit_now:
                 self._frame_signal_pending = True
@@ -260,11 +269,16 @@ class PlaybackWorker(QObject):
         self._seek_lock = threading.Lock()
         self._seek_target: int | None = None
         self._capture: cv2.VideoCapture | None = None
+        self._frame_signal_pending = False
         self.total_frames = 0
 
     def get_latest_context(self) -> FrameContext | None:
         with self._lock:
             return self._latest_context
+
+    def ack_frame_signal(self) -> None:
+        with self._lock:
+            self._frame_signal_pending = False
 
     @Slot()
     def start(self) -> None:
@@ -310,7 +324,11 @@ class PlaybackWorker(QObject):
             )
             with self._lock:
                 self._latest_context = context
-            self.frameAvailable.emit(frame_id)
+                emit_now = not self._frame_signal_pending
+                if emit_now:
+                    self._frame_signal_pending = True
+            if emit_now:
+                self.frameAvailable.emit(frame_id)
 
             elapsed = time.perf_counter() - start_time
             time.sleep(max(0.0, frame_delay - elapsed))

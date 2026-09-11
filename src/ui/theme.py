@@ -125,21 +125,85 @@ QWidget#LeftRail {{
     border-right: 1px solid {HAIRLINE};
 }}
 
+QLabel#RailBrand {{
+    color: {ACCENT};
+    font-size: 13px;
+    font-weight: bold;
+    letter-spacing: 2px;
+}}
+
+QLabel#RailTag {{
+    color: {TEXT_MUTED};
+    font-size: 10px;
+    margin-bottom: 4px;
+}}
+
 QFrame#RailCard {{
     background-color: {PANEL_ALT};
     border: 1px solid {HAIRLINE};
-    border-radius: 6px;
+    border-radius: 8px;
 }}
 
 QLabel#RailCardTitle {{
-    color: {TEXT_MUTED};
+    color: {ACCENT};
     font-size: 9px;
     font-weight: bold;
+    letter-spacing: 1px;
 }}
 
 QLabel#RailCardBody {{
     color: {TEXT_PRIMARY};
+    font-size: 12px;
+    font-weight: bold;
+}}
+
+QLabel#RailMetricKey {{
+    color: {TEXT_MUTED};
+    font-size: 10px;
+    font-weight: bold;
+}}
+
+QLabel#RailMetricVal {{
+    color: {TEXT_PRIMARY};
     font-size: 11px;
+    font-weight: bold;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+}}
+
+QLabel#RailStatusOk {{
+    color: {ACCENT};
+    font-size: 12px;
+    font-weight: bold;
+}}
+
+QLabel#RailStatusAlert {{
+    color: {ALERT};
+    font-size: 12px;
+    font-weight: bold;
+}}
+
+QCheckBox#RailCheck {{
+    color: {TEXT_PRIMARY};
+    font-size: 10px;
+    font-weight: bold;
+    spacing: 8px;
+}}
+
+QCheckBox#RailCheck::indicator {{
+    width: 12px;
+    height: 12px;
+    border: 1px solid {ACCENT};
+    border-radius: 2px;
+    background: {PANEL};
+}}
+
+QCheckBox#RailCheck::indicator:checked {{
+    background: {ACCENT};
+}}
+
+QWidget#Sparkline {{
+    background-color: {HAIRLINE};
+    border-radius: 4px;
 }}
 
 QWidget#IncidentsDrawer {{

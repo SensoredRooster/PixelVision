@@ -10,6 +10,36 @@ from typing import Tuple
 import cv2
 import numpy as np
 
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+
+_WRITER_CANDIDATES: tuple[tuple[str, str], ...] = (
+    (".mp4", "avc1"),
+    (".mp4", "H264"),
+    (".mp4", "mp4v"),
+    (".avi", "XVID"),
+    (".avi", "MJPG"),
+)
+
+
+def _even(value: int) -> int:
+    value = max(2, int(value))
+    return value if value % 2 == 0 else value - 1
+
+
+def _open_video_writer(path_stem: Path, fps: float, width: int, height: int) -> tuple[cv2.VideoWriter | None, Path | None]:
+    width = _even(width)
+    height = _even(height)
+    fps = max(1.0, float(fps))
+    for suffix, codec in _WRITER_CANDIDATES:
+        output_path = path_stem.with_suffix(suffix)
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+        if writer is not None and writer.isOpened():
+            return writer, output_path
+        if writer is not None:
+            writer.release()
+    return None, None
+
 
 class PixelVisionDatasetExporter:
     def __init__(self, target_resolution: Tuple[int, int] = (2560, 1440), project_root: str | None = None):
@@ -21,6 +51,7 @@ class PixelVisionDatasetExporter:
         self.clean_dir.mkdir(parents=True, exist_ok=True)
         self.suspicious_dir.mkdir(parents=True, exist_ok=True)
         self.video_writer: cv2.VideoWriter | None = None
+        self._output_path: Path | None = None
         self._write_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=60)
         self._writer_thread: threading.Thread | None = None
         self._writer_stop_event = threading.Event()
@@ -32,16 +63,15 @@ class PixelVisionDatasetExporter:
         self.is_recording_baseline = True
         self._writer_stop_event.clear()
         timestamp = int(time.time())
-        output_path = self.clean_dir / f"baseline_session_{timestamp}.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self.video_writer = cv2.VideoWriter(str(output_path), fourcc, 60.0, (self.width, self.height))
+        self._output_path = self.clean_dir / f"baseline_session_{timestamp}"
+        self.video_writer = None
         self._writer_thread = threading.Thread(target=self._baseline_writer_loop, daemon=True)
         self._writer_thread.start()
-        return str(output_path)
+        return str(self._output_path.with_suffix(".mp4"))
 
     def set_target_resolution(self, width: int, height: int) -> None:
-        self.width = max(1, int(width))
-        self.height = max(1, int(height))
+        self.width = _even(width)
+        self.height = _even(height)
 
     def stop_clean_baseline_mode(self) -> None:
         self.is_recording_baseline = False
@@ -53,7 +83,7 @@ class PixelVisionDatasetExporter:
         self._drain_write_queue()
 
     def write_frame(self, frame: np.ndarray) -> None:
-        if not self.is_recording_baseline or self.video_writer is None:
+        if not self.is_recording_baseline:
             return
         if self._write_queue.full():
             return
@@ -61,6 +91,19 @@ class PixelVisionDatasetExporter:
             self._write_queue.put_nowait(frame.copy())
         except queue.Full:
             return
+
+    def _ensure_writer(self, frame: np.ndarray) -> cv2.VideoWriter | None:
+        if self.video_writer is not None and self.video_writer.isOpened():
+            return self.video_writer
+        height, width = frame.shape[:2]
+        self.width = _even(width)
+        self.height = _even(height)
+        stem = self._output_path or (self.clean_dir / f"baseline_session_{int(time.time())}")
+        writer, path = _open_video_writer(stem, 60.0, self.width, self.height)
+        self.video_writer = writer
+        if path is not None:
+            self._output_path = path
+        return self.video_writer
 
     def _drain_write_queue(self) -> None:
         while True:
@@ -95,13 +138,14 @@ class PixelVisionDatasetExporter:
                 except queue.Empty:
                     continue
 
-                writer = self.video_writer
+                writer = self._ensure_writer(frame)
                 if writer is None:
-                    continue
+                    self._abort_writer()
+                    return
 
                 try:
                     if frame.shape[:2] != (self.height, self.width):
-                        frame = cv2.resize(frame, (self.width, self.height))
+                        frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
                     writer.write(frame)
                 except cv2.error:
                     self._abort_writer()
@@ -116,13 +160,17 @@ class PixelVisionDatasetExporter:
         if not historical_frames_buffer:
             return ""
 
-        output_path = self.suspicious_dir / f"flagged_incident_fr_{incident_id}_{int(time.time())}.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(output_path), fourcc, 60.0, (self.width, self.height))
+        first = historical_frames_buffer[0]
+        height, width = first.shape[:2]
+        stem = self.suspicious_dir / f"flagged_incident_fr_{incident_id}_{int(time.time())}"
+        writer, output_path = _open_video_writer(stem, 60.0, width, height)
+        if writer is None or output_path is None:
+            return ""
 
+        out_w, out_h = _even(width), _even(height)
         for frame in historical_frames_buffer:
-            if frame.shape[:2] != (self.height, self.width):
-                frame = cv2.resize(frame, (self.width, self.height))
+            if frame.shape[:2] != (out_h, out_w):
+                frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
             writer.write(frame)
 
         writer.release()

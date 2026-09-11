@@ -4,12 +4,88 @@ import time
 import subprocess
 import threading
 import re
+import sys
+import ctypes
 from collections import deque
+from ctypes import wintypes
 from typing import Any
 
 import cv2
 import numpy as np
 from mss import mss
+
+_BROWSER_TITLE_HINTS = (
+    "chrome",
+    "edge",
+    "firefox",
+    "brave",
+    "opera",
+    "kick",
+    "twitch",
+    "youtube",
+)
+_BROWSER_CLASSES = ("Chrome_WidgetWin_1", "MozillaWindowClass", "ApplicationFrameWindow")
+_BROWSER_SKIP = ("pixelvision",)
+_BROWSER_MIN_WIDTH = 400
+_BROWSER_MIN_HEIGHT = 300
+
+
+def _find_browser_window() -> tuple[int, dict[str, int]] | None:
+    if sys.platform != "win32":
+        return None
+    user32 = ctypes.windll.user32
+    found: list[tuple[int, int, dict[str, int]]] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = int(user32.GetWindowTextLengthW(hwnd))
+        if length <= 0:
+            return True
+        title_buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title_buf, length + 1)
+        title = title_buf.value.lower()
+        if any(skip in title for skip in _BROWSER_SKIP):
+            return True
+        class_buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_buf, 256)
+        class_name = class_buf.value
+        if class_name not in _BROWSER_CLASSES and not any(hint in title for hint in _BROWSER_TITLE_HINTS):
+            return True
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        width = int(rect.right - rect.left)
+        height = int(rect.bottom - rect.top)
+        if width < _BROWSER_MIN_WIDTH or height < _BROWSER_MIN_HEIGHT:
+            return True
+        region = {"left": int(rect.left), "top": int(rect.top), "width": width, "height": height}
+        found.append((width * height, int(hwnd), region))
+        return True
+
+    user32.EnumWindows(_enum, 0)
+    if not found:
+        return None
+    found.sort(key=lambda item: item[0], reverse=True)
+    _area, hwnd, region = found[0]
+    return hwnd, region
+
+
+def _window_region(hwnd: int) -> dict[str, int] | None:
+    if sys.platform != "win32" or not hwnd:
+        return None
+    user32 = ctypes.windll.user32
+    if not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+        return None
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    width = int(rect.right - rect.left)
+    height = int(rect.bottom - rect.top)
+    if width < _BROWSER_MIN_WIDTH or height < _BROWSER_MIN_HEIGHT:
+        return None
+    return {"left": int(rect.left), "top": int(rect.top), "width": width, "height": height}
 
 _RANGE_MODE_PATTERN = re.compile(
     r"(?:pixel_format|vcodec)=(\S+)\s+min s=(\d+)x(\d+) fps=([0-9.]+) max s=(\d+)x(\d+) fps=([0-9.]+)"
@@ -86,6 +162,22 @@ _BANDWIDTH_CEILING_BYTES_PER_SEC = 545_000_000
 _FREEZE_ABSDIFF_THRESHOLD = 1.5
 _FREEZE_HOLD_FRAMES = 90
 _FREEZE_SAMPLE_MAX_WIDTH = 320
+_PREVIEW_MAX_WIDTH = 1280
+_PREVIEW_MAX_FPS = 60
+
+
+def _preview_geometry(width: int, height: int, fps: int) -> tuple[int, int, int]:
+    out_fps = min(max(1, int(fps)), _PREVIEW_MAX_FPS)
+    if width <= _PREVIEW_MAX_WIDTH:
+        out_w, out_h = max(2, int(width)), max(2, int(height))
+    else:
+        out_w = _PREVIEW_MAX_WIDTH
+        out_h = max(2, int(round(height * (out_w / float(width)))))
+    if out_w % 2:
+        out_w -= 1
+    if out_h % 2:
+        out_h -= 1
+    return max(2, out_w), max(2, out_h), out_fps
 
 
 def _freeze_sample(frame: np.ndarray) -> np.ndarray:
@@ -101,9 +193,10 @@ def _freeze_sample(frame: np.ndarray) -> np.ndarray:
 class FFmpegRawVideoCapture:
     def __init__(self, device_name: str, width: int, height: int, fps: int):
         self.device_name = device_name
-        self.width = max(1, int(width))
-        self.height = max(1, int(height))
-        self.fps = max(1, int(fps))
+        self.input_width = max(1, int(width))
+        self.input_height = max(1, int(height))
+        self.input_fps = max(1, int(fps))
+        self.width, self.height, self.fps = _preview_geometry(self.input_width, self.input_height, self.input_fps)
         self._frame_size = self.width * self.height * 3
         self._process: subprocess.Popen[bytes] | None = None
         self._reader_thread: threading.Thread | None = None
@@ -139,11 +232,14 @@ class FFmpegRawVideoCapture:
             "-f",
             "dshow",
             "-framerate",
-            str(self.fps),
+            str(self.input_fps),
             "-video_size",
-            f"{self.width}x{self.height}",
+            f"{self.input_width}x{self.input_height}",
             "-i",
             input_spec,
+            "-an",
+            "-vf",
+            f"fps={self.fps},scale={self.width}:{self.height}:flags=fast_bilinear",
             "-pix_fmt",
             "bgr24",
             "-f",
@@ -294,13 +390,19 @@ class FrameSource:
         self._capture_device_name = str(settings.get("capture_device_name", "")).strip()
         self.camera_index = int(settings.get("camera_index", 0))
         self.settings = settings.copy()
+        self._follow_browser = str(settings.get("source_profile", "hdmi_game")) == "stream_window"
+        self._browser_hwnd = 0
+        self.monitor_index = int(settings.get("screen_monitor_index", 1))
+        self.region = settings.get("screen_region")
 
+        if self._follow_browser:
+            self.mode = "screen"
+            self.region = None
         if self.mode == "screen":
             self.screen = mss()
-            self.monitor_index = int(settings.get("screen_monitor_index", 1))
-            self.region = settings.get("screen_region")
-            if self.region is not None:
-                self.region = tuple(int(value) for value in self.region)
+            if self.region is not None and not isinstance(self.region, dict):
+                x0, y0, x1, y1 = (int(value) for value in self.region[:4])
+                self.region = {"left": x0, "top": y0, "width": max(1, x1 - x0), "height": max(1, y1 - y0)}
 
     def _is_capture_card_device(self) -> bool:
         capture_kind = self._capture_kind.lower()
@@ -504,10 +606,34 @@ class FrameSource:
 
         return not overflowed and frame_count > 0 and achieved_fps >= fps * _CALIBRATION_MIN_FPS_RATIO
 
+    def _resolve_browser_region(self) -> dict[str, int] | None:
+        region = _window_region(self._browser_hwnd)
+        if region is not None:
+            return region
+        found = _find_browser_window()
+        if found is None:
+            self._browser_hwnd = 0
+            return None
+        hwnd, region = found
+        self._browser_hwnd = hwnd
+        return region
+
     def open(self) -> bool:
         if self.mode == "screen":
             if self.screen is None:
                 self.screen = mss()
+            if self._follow_browser:
+                region = self._resolve_browser_region()
+                if region is None:
+                    return False
+                self.region = region
+                self.capture_width = float(region["width"])
+                self.capture_height = float(region["height"])
+                self.capture_fps = 30.0
+            elif isinstance(self.region, dict):
+                self.capture_width = float(self.region.get("width", 0) or 0)
+                self.capture_height = float(self.region.get("height", 0) or 0)
+                self.capture_fps = max(1.0, float(self.settings.get("capture_fps", 30) or 30))
             return True
 
         if self.capture is not None:
@@ -668,7 +794,15 @@ class FrameSource:
             if self.screen is None:
                 return False, None
 
-            if self.region is not None:
+            if self._follow_browser:
+                region = self._resolve_browser_region()
+                if region is None:
+                    return False, None
+                self.region = region
+                self.capture_width = float(region["width"])
+                self.capture_height = float(region["height"])
+                shot = self.screen.grab(region)
+            elif self.region is not None:
                 shot = self.screen.grab(self.region)
             else:
                 monitor = self.screen.monitors[self.monitor_index]

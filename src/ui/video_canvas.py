@@ -2,15 +2,14 @@ from __future__ import annotations
 
 from PySide6.QtCore import QRect, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
-from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtWidgets import QSizePolicy
+from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from src.core.anti_cheat_pipeline import FrameContext
 from src.ui.theme import ACCENT, CANVAS_IDLE_COLOR
 
 
-class VideoCanvas(QOpenGLWidget):
-    """GPU-composited letterboxed frame display.
+class VideoCanvas(QWidget):
+    """Letterboxed frame display.
 
     Holds a reference to the full FrameContext (not just the derived QImage)
     because QImage(Format_BGR888) wraps the backing numpy buffer without

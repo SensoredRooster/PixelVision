@@ -99,7 +99,7 @@ class ControlBar(QWidget):
             "detection on for the current live session."
         )
         self.analyze_display_checkbox.toggled.connect(self.analyzeDisplayToggled.emit)
-        layout.addWidget(self.analyze_display_checkbox)
+        self.analyze_display_checkbox.hide()
 
         self.record_baseline_btn = QPushButton("⏺ RECORD CLEAN BASELINE")
         self.record_baseline_btn.clicked.connect(self.recordBaselineToggled.emit)
