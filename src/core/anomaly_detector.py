@@ -174,11 +174,16 @@ class CrosshairKinematicsAnalyzer:
             dy = -scene_dy
             self.delta_history.append((dx, dy))
 
+            last_step = float((dx * dx + dy * dy) ** 0.5)
             if len(self.delta_history) < 4:
                 self.last_metrics = self._idle_metrics(
                     point,
                     {
-                        "velocity": float((dx * dx + dy * dy) ** 0.5),
+                        "velocity": last_step,
+                        "last_dx": dx,
+                        "last_dy": dy,
+                        "last_step": last_step,
+                        "max_step": last_step,
                         "flow_response": response,
                     },
                 )
@@ -220,6 +225,9 @@ class CrosshairKinematicsAnalyzer:
                 "zero_tremor_streak": self.zero_tremor_streak,
                 "flow_response": response,
                 "max_step": max_step,
+                "last_dx": dx,
+                "last_dy": dy,
+                "last_step": last_step,
                 "path": coords.tolist(),
                 "residuals": residuals.tolist(),
             }

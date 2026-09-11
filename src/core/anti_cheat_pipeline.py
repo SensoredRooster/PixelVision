@@ -148,6 +148,8 @@ class AntiCheatPipeline:
         self._content_frac = (0.0, 0.0, 1.0, 1.0)
         self._max_box_area_ratio = 0.35
         self.set_source_profile(source_profile)
+        self._prev_heads: dict[Any, tuple[float, float]] = {}
+        self._sticky_hits: dict[Any, int] = {}
 
     @property
     def detector_ready(self) -> bool:
@@ -342,6 +344,8 @@ class AntiCheatPipeline:
 
         skip_reason = self._scene_skip_reason(source_frame)
         if skip_reason:
+            self._prev_heads.clear()
+            self._sticky_hits.clear()
             self.crosshair_analyzer.reset()
             self.last_telemetry_snapshot = self._idle_telemetry(skip_reason)
             self.last_event_type = None
@@ -353,57 +357,65 @@ class AntiCheatPipeline:
         if self._check_duplicate(masked_frame):
             return None
 
-        metrics = self.crosshair_analyzer.update(masked_frame, frame_context.timestamp)
-        self.last_telemetry_snapshot = dict(self.crosshair_analyzer.last_metrics or self._idle_telemetry())
+        self.crosshair_analyzer.update(masked_frame, frame_context.timestamp)
+        metrics = dict(self.crosshair_analyzer.last_metrics or self._idle_telemetry())
+        self.last_telemetry_snapshot = dict(metrics)
         self.last_telemetry_snapshot["source_profile"] = self._source_profile
         self.last_telemetry_snapshot["ignore_rect_count"] = self.ignore_rect_count
         self.last_telemetry_snapshot["analysis_size"] = [analysis_w, analysis_h]
         self.last_telemetry_snapshot["display_size"] = [display_w, display_h]
-        if not metrics or not metrics.get("flagged"):
-            self.last_event_type = None
-            self.last_mechanical_lock_detected = False
-            return None
-
-        self.last_event_type = str(metrics.get("event_type", "crosshair_kinematic_anomaly"))
-        self.last_mechanical_lock_detected = self.last_event_type == "MECHANICAL_LOCK_NO_TREMOR"
-
-        corroboration_suppressed = False
-        associated_track_id = None
 
         with self._entities_lock:
             detector_has_result = self.detector_has_result
             tracked_entities_snapshot = list(self.last_tracked_entities)
 
-        analysis_point = metrics.get("point", (0, 0))
+        analysis_point = metrics.get("point", (analysis_w // 2, analysis_h // 2))
         px, py = analysis_point
         display_point = scale_point((px, py), (analysis_w, analysis_h), (display_w, display_h))
 
-        if self.detector_ready and detector_has_result:
+        replica = self._score_replica_aim(metrics, tracked_entities_snapshot, (px, py), analysis_w)
+        kinematic_flagged = bool(metrics.get("flagged"))
+        if replica is not None:
+            metrics["flagged"] = True
+            metrics["event_type"] = replica["event_type"]
+            metrics["confidence"] = replica["confidence"]
+            metrics["associated_track_id"] = replica.get("track_id")
+        elif not kinematic_flagged:
+            self.last_event_type = None
+            self.last_mechanical_lock_detected = False
+            return None
+
+        self.last_event_type = str(metrics.get("event_type", "crosshair_kinematic_anomaly"))
+        self.last_mechanical_lock_detected = self.last_event_type in {
+            "MECHANICAL_LOCK_NO_TREMOR",
+            "SNAP_TO_TARGET",
+            "STICKY_AIM",
+        }
+
+        associated_track_id = metrics.get("associated_track_id")
+        replica_event = self.last_event_type in {"SNAP_TO_TARGET", "STICKY_AIM", "FLICK_SNAP"}
+        if (
+            not replica_event
+            and self.detector_ready
+            and detector_has_result
+            and associated_track_id is None
+        ):
             best_match = None
             best_confidence = 0.0
-
             for entity in tracked_entities_snapshot:
                 bbox = entity.get("bbox", (0, 0, 0, 0))
                 x1, y1, x2, y2 = bbox
                 conf = entity.get("confidence", 0.0)
-
                 x1_padded = max(0, x1 - self.detection_corroboration_margin_px)
                 y1_padded = max(0, y1 - self.detection_corroboration_margin_px)
                 x2_padded = x2 + self.detection_corroboration_margin_px
                 y2_padded = y2 + self.detection_corroboration_margin_px
-
-                if x1_padded <= px <= x2_padded and y1_padded <= py <= y2_padded:
-                    if conf > best_confidence:
-                        best_confidence = conf
-                        best_match = entity
-
+                if x1_padded <= px <= x2_padded and y1_padded <= py <= y2_padded and conf > best_confidence:
+                    best_confidence = conf
+                    best_match = entity
             if best_match is None:
-                corroboration_suppressed = True
-            else:
-                associated_track_id = best_match.get("track_id", None)
-
-        if corroboration_suppressed:
-            return None
+                return None
+            associated_track_id = best_match.get("track_id")
 
         event = CheatEvent(
             timestamp=datetime.fromtimestamp(frame_context.timestamp).isoformat(),
@@ -440,7 +452,101 @@ class AntiCheatPipeline:
             self.last_tracked_entities = []
             self.detector_has_result = False
         self.crosshair_analyzer.reset()
-
+        self._prev_heads.clear()
+        self._sticky_hits.clear()
     def should_export_suspicious_clip(self) -> bool:
-        return self.last_mechanical_lock_detected and self.last_event_type == "MECHANICAL_LOCK_NO_TREMOR"
+        return self.last_event_type in {"MECHANICAL_LOCK_NO_TREMOR", "SNAP_TO_TARGET", "STICKY_AIM"}
+
+    @staticmethod
+    def _head_point(bbox: tuple[int, int, int, int] | list[int]) -> tuple[float, float] | None:
+        x1, y1, x2, y2 = map(int, bbox[:4])
+        w = x2 - x1
+        h = y2 - y1
+        if h < 8 or w < 8:
+            return None
+        hy = y1 + 0.20 * h
+        return ((x1 + x2) * 0.5, y1 + hy)
+
+    def _score_replica_aim(
+        self,
+        metrics: dict[str, Any],
+        entities: list[dict[str, Any]],
+        reticle: tuple[Any, Any],
+        analysis_w: int,
+    ) -> dict[str, Any] | None:
+        scale = max(float(analysis_w), 1.0) / 960.0
+        snap_min = 12.0 * scale
+        land_px = 34.0 * scale
+        sticky_err = 22.0 * scale
+        sticky_move = 10.0 * scale
+        sticky_need = 6
+        flick_px = 26.0 * scale
+        rx, ry = float(reticle[0]), float(reticle[1])
+        dx = float(metrics.get("last_dx") or 0.0)
+        dy = float(metrics.get("last_dy") or 0.0)
+        last_step = float(metrics.get("last_step") or (dx * dx + dy * dy) ** 0.5)
+        mean_velocity = float(metrics.get("velocity") or last_step)
+
+        heads: dict[Any, tuple[float, float]] = {}
+        snap: dict[str, Any] | None = None
+        for entity in entities:
+            bbox = entity.get("bbox")
+            if not bbox or len(bbox) < 4:
+                continue
+            head = self._head_point(bbox)
+            if head is None:
+                continue
+            track_id = entity.get("track_id")
+            heads[track_id] = head
+            hx, hy = head
+            err = float((hx - rx) ** 2 + (hy - ry) ** 2) ** 0.5
+            previous = self._prev_heads.get(track_id)
+            if last_step >= snap_min and err <= land_px:
+                aligned = True
+                if previous is not None:
+                    needed_x = previous[0] - rx
+                    needed_y = previous[1] - ry
+                    need_n = float((needed_x * needed_x + needed_y * needed_y) ** 0.5)
+                    if need_n >= snap_min * 0.55:
+                        align = (needed_x * dx + needed_y * dy) / (need_n * max(last_step, 1e-6))
+                        aligned = align >= 0.65
+                if aligned:
+                    confidence = min(1.0, 0.45 + last_step / (snap_min * 3.0) + (1.0 - err / max(land_px, 1.0)) * 0.4)
+                    if snap is None or confidence > snap["confidence"]:
+                        snap = {"event_type": "SNAP_TO_TARGET", "confidence": confidence, "track_id": track_id}
+            if err <= sticky_err and previous is not None:
+                moved = float((hx - previous[0]) ** 2 + (hy - previous[1]) ** 2) ** 0.5
+                if moved >= sticky_move:
+                    self._sticky_hits[track_id] = self._sticky_hits.get(track_id, 0) + 1
+                else:
+                    self._sticky_hits[track_id] = self._sticky_hits.get(track_id, 0)
+            else:
+                self._sticky_hits[track_id] = 0
+
+        for track_id in list(self._sticky_hits):
+            if track_id not in heads:
+                self._sticky_hits[track_id] = 0
+
+        sticky: dict[str, Any] | None = None
+        for track_id, hits in self._sticky_hits.items():
+            if hits >= sticky_need:
+                sticky = {
+                    "event_type": "STICKY_AIM",
+                    "confidence": min(1.0, 0.55 + hits / 20.0),
+                    "track_id": track_id,
+                }
+                break
+
+        self._prev_heads = heads
+        if snap is not None:
+            return snap
+        if sticky is not None:
+            return sticky
+        if last_step >= flick_px and last_step >= max(mean_velocity, 1.0) * 1.8:
+            return {
+                "event_type": "FLICK_SNAP",
+                "confidence": min(1.0, last_step / (flick_px * 1.6)),
+                "track_id": None,
+            }
+        return None
 
