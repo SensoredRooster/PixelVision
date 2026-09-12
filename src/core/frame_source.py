@@ -162,8 +162,10 @@ _BANDWIDTH_CEILING_BYTES_PER_SEC = 545_000_000
 _FREEZE_ABSDIFF_THRESHOLD = 1.5
 _FREEZE_HOLD_FRAMES = 90
 _FREEZE_SAMPLE_MAX_WIDTH = 320
-_PREVIEW_MAX_WIDTH = 1280
+_PREVIEW_MAX_WIDTH = 2560
 _PREVIEW_MAX_FPS = 60
+_MIN_AUTO_HEIGHT = 720
+_PREFERRED_AUTO_MODES = ((1920, 1080, 60.0), (2560, 1440, 60.0))
 
 
 def _preview_geometry(width: int, height: int, fps: int) -> tuple[int, int, int]:
@@ -173,6 +175,8 @@ def _preview_geometry(width: int, height: int, fps: int) -> tuple[int, int, int]
     else:
         out_w = _PREVIEW_MAX_WIDTH
         out_h = max(2, int(round(height * (out_w / float(width)))))
+    if out_h < _MIN_AUTO_HEIGHT and height >= _MIN_AUTO_HEIGHT:
+        out_w, out_h = max(2, int(width)), max(2, int(height))
     if out_w % 2:
         out_w -= 1
     if out_h % 2:
@@ -239,7 +243,7 @@ class FFmpegRawVideoCapture:
             input_spec,
             "-an",
             "-vf",
-            f"fps={self.fps},scale={self.width}:{self.height}:flags=fast_bilinear",
+            f"bwdif=mode=send_frame:parity=auto:deint=interlaced,fps={self.fps},scale={self.width}:{self.height}:flags=fast_bilinear,format=bgr24",
             "-pix_fmt",
             "bgr24",
             "-f",
@@ -511,17 +515,27 @@ class FrameSource:
         # actually advertises that exact resolution/fps combination --
         # otherwise this call fails outright with "Could not set video
         # options" instead of gracefully falling through the ladder.
+        for res_w, res_h, fps in _PREFERRED_AUTO_MODES:
+            if fps_supported((res_w, res_h), fps):
+                add((res_w, res_h, fps))
+
         requested_resolution = (requested_width, requested_height)
         if fps_supported(requested_resolution, requested_fps) and within_bandwidth_ceiling(
             requested_resolution, requested_fps
         ):
             add((requested_width, requested_height, requested_fps))
 
-        # Walk every resolution the device actually advertises, largest
-        # first, trying standard fps steps that fall within that specific
-        # resolution's real advertised range -- every candidate is therefore
-        # a mode the driver will actually accept, never a guess it rejects.
-        for res_w, res_h in sorted(resolution_fps_ranges, key=lambda r: r[0] * r[1], reverse=True):
+        hd_resolutions = sorted(
+            (res for res in resolution_fps_ranges if res[1] >= _MIN_AUTO_HEIGHT),
+            key=lambda r: r[0] * r[1],
+            reverse=True,
+        )
+        low_resolutions = sorted(
+            (res for res in resolution_fps_ranges if res[1] < _MIN_AUTO_HEIGHT),
+            key=lambda r: r[0] * r[1],
+            reverse=True,
+        )
+        for res_w, res_h in hd_resolutions + low_resolutions:
             if len(ordered) >= _MAX_CALIBRATION_CANDIDATES:
                 break
 
@@ -552,7 +566,9 @@ class FrameSource:
         # happen -- _probe_capture_card_mode already short-circuits when no
         # modes were parsed at all); 640x480@30 is about as universally
         # low-bandwidth as a capture device mode gets.
-        last_resort = ladder[-1] if ladder else (640, 480, 30.0)
+        hd_ladder = [mode for mode in ladder if mode[1] >= _MIN_AUTO_HEIGHT]
+        low_ladder = [mode for mode in ladder if mode[1] < _MIN_AUTO_HEIGHT]
+        last_resort = (hd_ladder[0] if hd_ladder else None) or (ladder[-1] if ladder else (1920, 1080, 60.0))
 
         # A two-phase fast-screen/strict-verify split was tried and reverted:
         # a lax short-window first pass can reject a perfectly good candidate
@@ -566,7 +582,14 @@ class FrameSource:
         # _build_calibration_ladder is what keeps total candidates -- and
         # therefore calibration time -- down, without weakening verification
         # of what's actually tried.
-        for width, height, fps in ladder:
+        for width, height, fps in hd_ladder:
+            if self._verify_candidate_strict(device_name, width, height, fps):
+                return width, height, fps
+
+        if hd_ladder:
+            return hd_ladder[0]
+
+        for width, height, fps in low_ladder:
             if self._verify_candidate_strict(device_name, width, height, fps):
                 return width, height, fps
 

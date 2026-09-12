@@ -200,9 +200,12 @@ class LeftRail(QWidget):
 
         root.addStretch(1)
 
-    def set_source(self, name: str, mode: str, backend: str) -> None:
+    def set_source(self, name: str, mode: str, backend: str, *, low_mode: bool = False) -> None:
         self._source_name.setText(name or "—")
-        self._source_mode.set_value(mode or "—")
+        if low_mode:
+            self._source_mode.set_value("low mode", warn=True)
+        else:
+            self._source_mode.set_value(mode or "—")
         self._source_backend.set_value(backend or "—")
 
     def set_signal(self, *, frozen: bool, straightness: float, tremor: float) -> None:

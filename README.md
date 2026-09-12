@@ -12,11 +12,12 @@ The desktop UI is **PySide6** (not CustomTkinter). Entry point is `python main.p
 
 - Live capture from DirectShow devices (webcam vs capture card, auto-labeled)
 - ffmpeg(dshow) calibration so HDMI cards do not freeze on an unsupported mode
+- AUTO capture prefers **1920×1080@60**, then **2560×1440@60**. Height below 720 is **low mode**, not a successful AUTO result
 - **Latest-frame LIVE path** — slow analysis/UI/baseline drops frames; it does not queue a backlog
 - Status bar shows the **negotiated** capture `width×height @ fps`, not the settings.json request
 - VOD playback with seek-to-incident
 - Source profiles (`SRC` on the top bar): HDMI game, stream window, VOD file
-- Scene gate: skip aim scoring on frozen/black frames, cinematic letterbox, or missing HUD energy
+- Scene gate: 20-frame Live/Held hysteresis. Short black/no_hud bursts stay Live; a held scene keeps the last Live frame and a `GATE:<reason>` chip. STR/TREMOR idle at 0 on menus
 - Ignore rects for facecam / stream chrome / chat (center-point test on tracks)
 - Aim scoring via **phase correlation** under the reticle (camera snap, not a moving-sprite tracker)
 - Optional YOLO player boxes to corroborate a flag (off in LIVE unless you opt in)
@@ -61,7 +62,7 @@ Weights are gitignored. The console still scores aim without them.
 Top bar (44px): Mount VOD, Rescan, **SRC** profile, STANDARD/HEATMAP/FLAGGED,
 RES/FPS (VOD/manual only), LIVE/VOD pill, Analyze checkbox, clean baseline.
 
-- **SOURCE** card — device or VOD name plus negotiated mode
+- **SOURCE** card — device or VOD name plus negotiated mode. Yellow **low mode** when height is below 720
 - **SIGNAL** card — `ok · str 0.25 · tremor 3.7` (or `FREEZE`) at 4 Hz
 - Canvas paints at 30 Hz from the newest completed frame
 - **INCIDENTS** drawer — collapsed 28px grip; expands on the first flag (capped at 500)
@@ -87,7 +88,9 @@ Tracks whose bbox **center** sits in an ignore rect are dropped. Kinematics
 sample the center ROI only; ignore pixels are zeroed first.
 
 If the frame is not live gameplay (frozen, black, letterbox, no minimap/ammo/stance
-energy), kinematics and CheatEvents are skipped. YOLO can still run when Analyze is on.
+energy), SceneGate counts toward Held. After 20 consecutive skip frames the canvas
+holds the last Live picture; kinematics and CheatEvents stay off. Short bursts do
+not reset the analyzer. YOLO can still run when Analyze is on.
 
 ## Capture settings
 
@@ -97,9 +100,9 @@ energy), kinematics and CheatEvents are skipped. YOLO can still run when Analyze
 |---|---|
 | `capture_mode` | `camera` or `screen` |
 | `source_profile` | `hdmi_game`, `stream_window`, or `vod_file` |
-| \game_profile\ | HUD layout: \warzone\ (default) or \generic\ (see \config/game_profiles/\) |
+| `game_profile` | HUD layout: `warzone` (default) or `generic` (see `config/game_profiles/`) |
 | `stream_chat_ignore` | Include the right-chat ignore rect on stream/VOD (default `true`) |
-| `capture_width` / `capture_height` / `capture_fps` | Requested mode; AUTO in the UI lets the card calibrate. Status bar uses what the device actually opened. |
+| `capture_width` / `capture_height` / `capture_fps` | Requested mode. AUTO calibrates the card: try 1080p60, then 1440p60. Do not treat 540p as AUTO success. Status bar uses what the device actually opened. |
 | `player_detector_model_path` | ONNX detector, default `data/models/yolov8n.onnx` |
 | `facecam_roi` | Empty = default facecam ignore box |
 | `playback_fps` | Mounted-clip FPS; `0` = auto |
@@ -120,7 +123,8 @@ corroboration; overlays scale them onto the native capture frame.
 
 - `main.py` — entry
 - `src/app.py` — Qt bootstrap
-- `src/core/frame_source.py` — camera / screen / ffmpeg capture + freeze latch
+- `src/core/frame_source.py` — camera / screen / ffmpeg capture, AUTO 1080p60/1440p60 ladder, freeze latch
+- `src/core/scene_gate.py` — Live/Held hysteresis
 - `src/core/anti_cheat_pipeline.py` — profiles, ignore rects, scene gate, corroboration
 - `src/core/anomaly_detector.py` — phase-correlation aim scoring
 - `src/core/hud_masker.py` — Warzone HUD mask + HUD-energy / letterbox checks
@@ -129,7 +133,8 @@ corroboration; overlays scale them onto the native capture frame.
 - `src/ui/main_window.py` — review console
 - `src/ui/workers.py` — capture / playback / analysis / detection threads
 - `config/settings.json` — defaults
-- `tests/` — aim tracker + coordinate-space unit tests
+- `config/game_profiles/` — HUD layouts (`warzone`, `generic`)
+- `tests/` — aim tracker, coordinate-space, and SceneGate unit tests
 
 ## Training (optional)
 

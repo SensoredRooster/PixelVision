@@ -532,13 +532,20 @@ class MainWindow(QMainWindow):
             device_label = (
                 self._current_device.get("label", self._current_device_name) if self._current_device else self._current_device_name
             )
+        low_mode = int(height) < 720
         self.left_rail.set_source(
             device_label or "Capture device",
             f"{width}×{height} @ {fps:.0f}",
             backend,
+            low_mode=low_mode,
         )
         self._update_signal_card()
-        print(f"[CAPTURE] [SUCCESS] Source opened at {width}x{height} @ {fps:.0f}fps ({backend})")
+        if low_mode:
+            self._live_status_text += " · ⚠ low mode"
+            self.status_label.setText(self._status_text_with_mode())
+            print(f"[CAPTURE] [LOW MODE] Source opened at {width}x{height} @ {fps:.0f}fps ({backend})")
+        else:
+            print(f"[CAPTURE] [SUCCESS] Source opened at {width}x{height} @ {fps:.0f}fps ({backend})")
 
     @Slot(str)
     def _on_capture_error(self, message: str) -> None:
@@ -587,7 +594,12 @@ class MainWindow(QMainWindow):
         filename = getattr(self, "_mounted_vod_name", "VOD")
         self._vod_status_text = f"VOD · {filename} · {width}×{height} @ {fps:.0f}"
         self.status_label.setText(self._status_text_with_mode())
-        self.left_rail.set_source(filename, f"{width}×{height} @ {fps:.0f}", "VOD")
+        self.left_rail.set_source(
+            filename,
+            f"{width}×{height} @ {fps:.0f}",
+            "VOD",
+            low_mode=int(height) < 720,
+        )
         self._update_signal_card()
 
     @Slot(int)
