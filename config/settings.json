@@ -7,7 +7,12 @@
   "capture_height": 1440,
   "capture_fps": 144,
   "screen_monitor_index": 1,
-  "screen_region": [0, 0, 2560, 1440],
+  "screen_region": [
+    0,
+    0,
+    2560,
+    1440
+  ],
   "playback_fps": 0,
   "log_directory": "logs",
   "window_title": "PixelVision",
@@ -15,9 +20,12 @@
   "player_detector_model_path": "data/models/yolov8n.onnx",
   "detection_confidence_threshold": 0.45,
   "detection_nms_threshold": 0.45,
-  "detection_player_class_ids": [0],
+  "detection_player_class_ids": [
+    0
+  ],
   "detection_corroboration_margin_px": 12,
   "facecam_roi": [],
   "source_profile": "hdmi_game",
-  "stream_chat_ignore": true
+  "stream_chat_ignore": true,
+  "game_profile": "warzone"
 }

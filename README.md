@@ -97,6 +97,7 @@ energy), kinematics and CheatEvents are skipped. YOLO can still run when Analyze
 |---|---|
 | `capture_mode` | `camera` or `screen` |
 | `source_profile` | `hdmi_game`, `stream_window`, or `vod_file` |
+| \game_profile\ | HUD layout: \warzone\ (default) or \generic\ (see \config/game_profiles/\) |
 | `stream_chat_ignore` | Include the right-chat ignore rect on stream/VOD (default `true`) |
 | `capture_width` / `capture_height` / `capture_fps` | Requested mode; AUTO in the UI lets the card calibrate. Status bar uses what the device actually opened. |
 | `player_detector_model_path` | ONNX detector, default `data/models/yolov8n.onnx` |

@@ -140,6 +140,7 @@ class MainWindow(QMainWindow):
             detection_corroboration_margin_px=int(settings.get("detection_corroboration_margin_px", 12)),
             facecam_roi=facecam_roi,
             source_profile=str(settings.get("source_profile", "hdmi_game")),
+            game_profile=str(settings.get("game_profile", "warzone")),
             stream_chat_ignore=bool(settings.get("stream_chat_ignore", True)),
         )
         self.live_overlay = PixelVisionLiveOverlay()

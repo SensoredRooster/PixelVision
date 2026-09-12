@@ -1,0 +1,8 @@
+{
+  "id": "generic",
+  "label": "Generic FPS",
+  "require_hud_energy": false,
+  "hud_energy_stdev": 12.0,
+  "hud_energy_frac": [],
+  "hud_mask_frac": []
+}

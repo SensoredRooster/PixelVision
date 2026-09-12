@@ -12,7 +12,7 @@ import numpy as np
 
 from src.core.anomaly_detector import CrosshairKinematicsAnalyzer
 from src.core.dataset_exporter import PixelVisionDatasetExporter
-from src.core.hud_masker import WarzoneHUDMasker, scale_bbox, scale_point
+from src.core.hud_masker import HUDMasker, WarzoneHUDMasker, scale_bbox, scale_point
 from src.core.object_detector import PixelVisionObjectDetector
 from src.core.scene_gate import HELD, SceneGate
 
@@ -114,10 +114,11 @@ class AntiCheatPipeline:
         detection_corroboration_margin_px: int = 12,
         facecam_roi: tuple[int, int, int, int] | list[int] | None = None,
         source_profile: str = "hdmi_game",
+        game_profile: str = "warzone",
         stream_chat_ignore: bool = True,
     ):
         self.logger = PixelVisionLogger(log_dir=log_dir)
-        self.hud_masker = WarzoneHUDMasker(target_resolution=target_resolution)
+        self.hud_masker = HUDMasker(target_resolution=target_resolution, game_profile=game_profile)
         self.crosshair_analyzer = CrosshairKinematicsAnalyzer()
         self.analysis_stride = max(1, int(analysis_stride))
         self.frame_counter = 0
@@ -202,6 +203,13 @@ class AntiCheatPipeline:
         else:
             self._content_frac = (0.0, 0.10, 0.80, 0.88)
         self._rebuild_ignore_rects()
+
+    def set_game_profile(self, profile: str) -> None:
+        self.hud_masker.set_game_profile(profile)
+
+    @property
+    def game_profile(self) -> str:
+        return self.hud_masker.profile_id
 
     def _rebuild_ignore_rects(self) -> None:
         width, height = self._target_resolution
