@@ -422,15 +422,12 @@ class AnalysisWorker(QObject):
         if ctx is None or ctx.frame_id == self._last_analyzed_frame_id:
             return
 
-        if not self._pipeline.should_analyze_frame(ctx.frame_id):
-            return
-        with self._source_lock:
-            self._last_analyzed_frame_id = ctx.frame_id
-
-        if ctx.analysis_frame is None:
+        if ctx.analysis_frame is None and self._pipeline.should_analyze_frame(ctx.frame_id):
             ctx.analysis_frame = _downscale(ctx.frame, 960, 540)
 
         event = self._pipeline.process_frame(frame_context=ctx)
+        with self._source_lock:
+            self._last_analyzed_frame_id = ctx.frame_id
 
         telemetry = dict(self._pipeline.last_telemetry_snapshot or {})
         telemetry["flagged"] = event is not None

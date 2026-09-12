@@ -6,6 +6,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from PySide6.QtCore import Qt, QThread, QTimer, Slot
 from PySide6.QtGui import QCloseEvent, QColor, QImage, QPainter
@@ -36,6 +37,45 @@ from src.ui.workers import AnalysisWorker, CaptureWorker, DetectionWorker, Playb
 # Cap on retained flagged-track markers so a continuous LIVE session can't grow
 # this without bound. Oldest flagged track is forgotten first (FIFO).
 _MAX_FLAGGED_TRACK_IDS = 500
+_GATE_CHIP_FONT = cv2.FONT_HERSHEY_SIMPLEX
+_GATE_CHIP_FONT_SCALE = 0.45
+_GATE_CHIP_THICKNESS = 1
+_GATE_CHIP_PAD = 6
+_GATE_CHIP_TEXT_COLOR = (90, 220, 120)
+_GATE_CHIP_BG_COLOR = (10, 16, 12)
+
+
+def _with_gate_chip(frame: np.ndarray, reason: str) -> np.ndarray:
+    if frame.size == 0:
+        return frame.copy()
+    canvas = frame.copy()
+    text = f"GATE:{reason}"
+    (text_w, text_h), baseline = cv2.getTextSize(
+        text,
+        _GATE_CHIP_FONT,
+        _GATE_CHIP_FONT_SCALE,
+        _GATE_CHIP_THICKNESS,
+    )
+    height, width = canvas.shape[:2]
+    x1 = min(_GATE_CHIP_PAD, max(0, width - 1))
+    y1 = min(_GATE_CHIP_PAD, max(0, height - 1))
+    x2 = min(width - 1, max(x1, x1 + text_w + _GATE_CHIP_PAD * 2))
+    y2 = min(height - 1, max(y1, y1 + text_h + baseline + _GATE_CHIP_PAD * 2))
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), _GATE_CHIP_BG_COLOR, -1)
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), (35, 55, 40), 1)
+    text_x = min(max(x1 + _GATE_CHIP_PAD, 0), max(0, width - 1))
+    text_y = min(max(y1 + _GATE_CHIP_PAD + text_h, 0), max(0, height - 1))
+    cv2.putText(
+        canvas,
+        text,
+        (text_x, text_y),
+        _GATE_CHIP_FONT,
+        _GATE_CHIP_FONT_SCALE,
+        _GATE_CHIP_TEXT_COLOR,
+        _GATE_CHIP_THICKNESS,
+        cv2.LINE_AA,
+    )
+    return canvas
 
 
 class VerticalLabel(QWidget):
@@ -108,6 +148,8 @@ class MainWindow(QMainWindow):
         self._view_mode = "standard"
         self._stream_mode = "live"
         self._last_rendered_frame_id = -1
+        self._last_rendered_gate_live = None
+        self._last_rendered_gate_reason = None
         self._last_paint_time = 0.0
         self._last_signal_paint_time = 0.0
         self._latest_telemetry: dict = {}
@@ -604,7 +646,7 @@ class MainWindow(QMainWindow):
             tracks = len(self.pipeline.last_tracked_entities)
         except Exception:
             tracks = 0
-        gate = str(telemetry.get("scene_skip") or "live")
+        gate = self.pipeline.gate_reason()
         self.left_rail.set_detect(yolo_on=yolo_on, tracks=tracks, gate=gate)
         profile = SOURCE_PROFILE_LABELS.get(
             str(self.settings.get("source_profile", "hdmi_game")),
@@ -650,33 +692,42 @@ class MainWindow(QMainWindow):
         ctx = source.get_latest_context()
         if ctx is None:
             return
-        if ctx.frame_id == self._last_rendered_frame_id:
+        gate_reason = self.pipeline.gate_reason()
+        is_gate_live = self.pipeline.is_gate_live()
+        if (
+            ctx.frame_id == self._last_rendered_frame_id
+            and is_gate_live == self._last_rendered_gate_live
+            and gate_reason == self._last_rendered_gate_reason
+        ):
             return
         self._last_paint_time = now
         self._last_rendered_frame_id = ctx.frame_id
+        self._last_rendered_gate_live = is_gate_live
+        self._last_rendered_gate_reason = gate_reason
 
         flagged_event = self._pending_flagged_event
         self._pending_flagged_event = None
         is_flagged = flagged_event is not None
 
-        display_frame = ctx.frame
+        display_frame = self.pipeline.get_display_frame(ctx.frame)
         render_error: str | None = None
         try:
-            entities = self.pipeline.get_tracked_entities()
-            needs_overlay = is_flagged or bool(entities) or self._view_mode != "standard"
-            if needs_overlay:
-                display_frame = self.advanced_overlay.compile_display_frame(
-                    ctx.frame,
-                    entities,
-                    flagged_event,
-                    mode=self._view_mode,
-                    flagged_track_ids=self._flagged_track_ids,
-                )
-                flagged_id = flagged_event.telemetry_data.get("associated_track_id") if flagged_event else None
-                if entities:
-                    display_frame = self.live_overlay.render_overlays(display_frame, entities, flagged_id=flagged_id)
+            if is_gate_live:
+                entities = self.pipeline.get_tracked_entities()
+                needs_overlay = is_flagged or bool(entities) or self._view_mode != "standard"
+                if needs_overlay:
+                    display_frame = self.advanced_overlay.compile_display_frame(
+                        display_frame,
+                        entities,
+                        flagged_event,
+                        mode=self._view_mode,
+                        flagged_track_ids=self._flagged_track_ids,
+                    )
+                    flagged_id = flagged_event.telemetry_data.get("associated_track_id") if flagged_event else None
+                    if entities:
+                        display_frame = self.live_overlay.render_overlays(display_frame, entities, flagged_id=flagged_id)
         except Exception as exc:
-            display_frame = ctx.frame
+            display_frame = self.pipeline.get_display_frame(ctx.frame)
             render_error = repr(exc)
 
         try:
@@ -690,6 +741,8 @@ class MainWindow(QMainWindow):
                     (max(1, int(source_w * scale)), max(1, int(source_h * scale))),
                     interpolation=cv2.INTER_AREA,
                 )
+            if not is_gate_live:
+                display_frame = _with_gate_chip(display_frame, gate_reason)
             if not display_frame.flags["C_CONTIGUOUS"]:
                 display_frame = display_frame.copy()
             height, width = display_frame.shape[:2]

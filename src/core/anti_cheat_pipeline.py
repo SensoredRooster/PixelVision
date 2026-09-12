@@ -14,6 +14,7 @@ from src.core.anomaly_detector import CrosshairKinematicsAnalyzer
 from src.core.dataset_exporter import PixelVisionDatasetExporter
 from src.core.hud_masker import WarzoneHUDMasker, scale_bbox, scale_point
 from src.core.object_detector import PixelVisionObjectDetector
+from src.core.scene_gate import HELD, SceneGate
 
 
 @dataclass
@@ -143,6 +144,7 @@ class AntiCheatPipeline:
         self.facecam_roi = _frac_to_pixels(*target_resolution, self._facecam_frac)
         self._stream_chat_ignore = bool(stream_chat_ignore)
         self._stream_frozen = False
+        self.scene_gate = SceneGate()
         self._ignore_fracs: list[tuple[float, float, float, float]] = []
         self._ignore_rects_px: list[tuple[int, int, int, int]] = []
         self._content_frac = (0.0, 0.0, 1.0, 1.0)
@@ -238,6 +240,15 @@ class AntiCheatPipeline:
         if not self.hud_masker.hud_energy_present(frame, self._content_frac):
             return "no_hud"
         return None
+
+    def is_gate_live(self) -> bool:
+        return self.scene_gate.is_live
+
+    def gate_reason(self) -> str:
+        return self.scene_gate.reason
+
+    def get_display_frame(self, current: np.ndarray) -> np.ndarray:
+        return self.scene_gate.display_frame(current)
 
     def _idle_telemetry(self, scene_skip: str | None = None) -> dict[str, Any]:
         snapshot = {
@@ -342,14 +353,26 @@ class AntiCheatPipeline:
         self._analysis_size = (analysis_w, analysis_h)
         self._display_size = (display_w, display_h)
 
-        skip_reason = self._scene_skip_reason(source_frame)
-        if skip_reason:
+        raw = self._scene_skip_reason(source_frame)
+        was_held = self.scene_gate.published == HELD
+        self.scene_gate.update(raw, None if raw else display_frame)
+        if not was_held and self.scene_gate.published == HELD:
+            held = self.scene_gate.last_live_frame
+            if held is not None:
+                self.scene_gate.last_live_frame = held.copy()
+        if self.scene_gate.published == HELD:
+            self.crosshair_analyzer.reset()
             self._prev_heads.clear()
             self._sticky_hits.clear()
-            self.crosshair_analyzer.reset()
-            self.last_telemetry_snapshot = self._idle_telemetry(skip_reason)
             self.last_event_type = None
             self.last_mechanical_lock_detected = False
+            self.last_telemetry_snapshot = self._idle_telemetry(self.scene_gate.reason)
+            return None
+        if raw:
+            self.last_telemetry_snapshot = self._idle_telemetry(raw)
+            return None
+
+        if not self.should_analyze_frame(frame_context.frame_id):
             return None
 
         masked_frame = self.hud_masker.apply_mask(source_frame)
@@ -448,12 +471,14 @@ class AntiCheatPipeline:
         self.last_event_type = None
         self.last_mechanical_lock_detected = False
         self._stream_frozen = False
+        self.scene_gate.reset()
         with self._entities_lock:
             self.last_tracked_entities = []
             self.detector_has_result = False
         self.crosshair_analyzer.reset()
         self._prev_heads.clear()
         self._sticky_hits.clear()
+
     def should_export_suspicious_clip(self) -> bool:
         return self.last_event_type in {"MECHANICAL_LOCK_NO_TREMOR", "SNAP_TO_TARGET", "STICKY_AIM"}
 
