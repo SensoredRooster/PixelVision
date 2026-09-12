@@ -29,11 +29,11 @@ class CrosshairKinematicsAnalyzer:
 
     def __init__(
         self,
-        window_size: int = 12,
+        window_size: int = 18,
         roi_ratio: float = 0.22,
-        velocity_threshold: float = 12.0,
-        straightness_threshold: float = 0.96,
-        snap_threshold: float = 28.0,
+        velocity_threshold: float = 16.0,
+        straightness_threshold: float = 0.985,
+        snap_threshold: float = 36.0,
         zero_variance_epsilon: float = 0.45,
         min_phase_response: float = 0.12,
         lock_streak: int = 3,

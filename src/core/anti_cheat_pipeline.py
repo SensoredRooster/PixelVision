@@ -153,6 +153,8 @@ class AntiCheatPipeline:
         self.set_source_profile(source_profile)
         self._prev_heads: dict[Any, tuple[float, float]] = {}
         self._sticky_hits: dict[Any, int] = {}
+        self._flag_streak = 0
+        self._flag_streak_type: str | None = None
 
     @property
     def detector_ready(self) -> bool:
@@ -414,6 +416,8 @@ class AntiCheatPipeline:
         elif not kinematic_flagged:
             self.last_event_type = None
             self.last_mechanical_lock_detected = False
+            self._flag_streak = 0
+            self._flag_streak_type = None
             return None
 
         self.last_event_type = str(metrics.get("event_type", "crosshair_kinematic_anomaly"))
@@ -430,6 +434,7 @@ class AntiCheatPipeline:
             and self.detector_ready
             and detector_has_result
             and associated_track_id is None
+            and tracked_entities_snapshot
         ):
             best_match = None
             best_confidence = 0.0
@@ -447,6 +452,17 @@ class AntiCheatPipeline:
             if best_match is None:
                 return None
             associated_track_id = best_match.get("track_id")
+
+        # Require sustained kinematics before logging a cheat event.
+        # Short legit pans at 60Hz analysis otherwise look perfectly straight.
+        min_persist = 3 if associated_track_id is not None else 15
+        if self._flag_streak_type == self.last_event_type:
+            self._flag_streak += 1
+        else:
+            self._flag_streak_type = self.last_event_type
+            self._flag_streak = 1
+        if self._flag_streak < min_persist:
+            return None
 
         event = CheatEvent(
             timestamp=datetime.fromtimestamp(frame_context.timestamp).isoformat(),
@@ -486,6 +502,8 @@ class AntiCheatPipeline:
         self.crosshair_analyzer.reset()
         self._prev_heads.clear()
         self._sticky_hits.clear()
+        self._flag_streak = 0
+        self._flag_streak_type = None
 
     def should_export_suspicious_clip(self) -> bool:
         return self.last_event_type in {"MECHANICAL_LOCK_NO_TREMOR", "SNAP_TO_TARGET", "STICKY_AIM"}
@@ -575,11 +593,19 @@ class AntiCheatPipeline:
             return snap
         if sticky is not None:
             return sticky
-        if last_step >= flick_px and last_step >= max(mean_velocity, 1.0) * 1.8:
-            return {
-                "event_type": "FLICK_SNAP",
-                "confidence": min(1.0, last_step / (flick_px * 1.6)),
-                "track_id": None,
-            }
+        # Free flick without a player track is mostly mouse-turn noise on legit VODs.
+        if heads and last_step >= flick_px and last_step >= max(mean_velocity, 1.0) * 1.8:
+            nearest_id = min(
+                heads,
+                key=lambda tid: (heads[tid][0] - rx) ** 2 + (heads[tid][1] - ry) ** 2,
+            )
+            hx, hy = heads[nearest_id]
+            err = float((hx - rx) ** 2 + (hy - ry) ** 2) ** 0.5
+            if err <= land_px * 1.35:
+                return {
+                    "event_type": "FLICK_SNAP",
+                    "confidence": min(1.0, last_step / (flick_px * 1.6)),
+                    "track_id": nearest_id,
+                }
         return None
 

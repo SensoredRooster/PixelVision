@@ -92,15 +92,30 @@ def analyze_clip(
     width: int,
     height: int,
     max_frames: int,
+    target_hz: float = 60.0,
+    detect_hz: float = 10.0,
 ) -> dict[str, Any]:
+    """Score a clip at ~target_hz and run YOLO corroboration at detect_hz.
+
+    High-fps sources (e.g. 144Hz captures) must be decimated; a 12-frame
+    kinematics window is only ~80ms at 144fps and false-flags real pans.
+    """
     cap = cv2.VideoCapture(str(clip_path))
     if not cap.isOpened():
         return {"ok": False, "error": "open_failed", "events": [], "frames": 0}
 
+    source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or target_hz
+    analyze_stride = max(1, int(round(source_fps / max(target_hz, 1.0))))
+    detect_stride = max(analyze_stride, int(round(source_fps / max(detect_hz, 1.0))))
+
     pipeline.reset_stream_state()
     pipeline.update_target_resolution(width, height)
+    # Offline eval should not skip kinematics via live analysis_stride.
+    pipeline.analysis_stride = 1
+
     events: list[dict[str, Any]] = []
     frame_id = 0
+    analyzed = 0
     t0 = time.perf_counter()
 
     while True:
@@ -109,12 +124,22 @@ def analyze_clip(
         ok, frame = cap.read()
         if not ok or frame is None:
             break
+
+        if frame_id % analyze_stride != 0:
+            frame_id += 1
+            continue
+
         if frame.shape[1] != width or frame.shape[0] != height:
             frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+
+        if frame_id % detect_stride == 0 and pipeline.detector_ready:
+            entities = pipeline.player_detector.detect_and_track(frame)
+            pipeline.update_detected_entities(entities, frame.shape, frame.shape)
+
         ctx = FrameContext(
             frame=frame,
-            timestamp=frame_id / 60.0,
-            frame_id=frame_id,
+            timestamp=frame_id / source_fps,
+            frame_id=analyzed,
             source=str(clip_path),
             is_duplicate=False,
             analysis_frame=frame,
@@ -128,6 +153,7 @@ def analyze_clip(
                     "confidence": float(event.confidence_score),
                 }
             )
+        analyzed += 1
         frame_id += 1
 
     cap.release()
@@ -136,6 +162,9 @@ def analyze_clip(
     return {
         "ok": True,
         "frames": frame_id,
+        "analyzed_frames": analyzed,
+        "source_fps": source_fps,
+        "analyze_stride": analyze_stride,
         "elapsed_sec": round(elapsed, 3),
         "flagged": bool(events),
         "event_count": len(events),
@@ -168,6 +197,7 @@ def main() -> int:
     pipeline = AntiCheatPipeline(
         target_resolution=(args.width, args.height),
         source_profile="vod_file",
+        game_profile="warzone",
         analysis_stride=1,
         detection_player_class_ids=[0],
         player_detector_model_path=str(ROOT / "data" / "models" / "yolov8n.onnx"),
