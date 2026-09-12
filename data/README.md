@@ -32,3 +32,16 @@ Required columns:
 - label: clean, aimbot, wallhack, esp, speedhack, macro, unknown
 - game: Warzone, Valorant, Apex, CS2, Fortnite, etc.
 - mode: ranked, casual, scrim, training
+
+## Eval workflow
+
+Synthetic kinematics smoke test (not a substitute for real VODs):
+
+```bash
+python tools/make_synthetic_eval.py --out data/eval_synthetic
+python tools/import_dataset.py --input data/eval_synthetic/clips --labels data/eval_synthetic/labels.csv --output data --analyze --report data/eval_synthetic/eval_report.json
+```
+
+Real VODs: drop clips in `raw/`, fill `labels_template.csv`, then run `import_dataset.py` the same way.
+
+Note: offline import uses `analysis_stride=1`. Live capture still defaults to stride 3; with SceneGate `no_hud` streaks that can starve kinematics history — keep an eye on it when tuning LIVE.

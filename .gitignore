@@ -22,3 +22,7 @@ startup_crash.log
 *.pt
 *.onnx
 *.onnx.data
+
+data/eval_synthetic/
+data/training.csv
+
